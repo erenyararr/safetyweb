@@ -7,6 +7,7 @@ import uuid
 import psycopg2
 import psycopg2.extras
 import io
+import numpy as np
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -15,11 +16,11 @@ from reportlab.lib.styles import getSampleStyleSheet
 from config import API_KEY
 openai.api_key = API_KEY
 
-# Kullanıcı girişi
+# Login
 USERNAME = "selectsafety"
 PASSWORD = "eren1234"
 
-# Postgres bağlantısı
+# Postgres connection
 DB_URL = os.getenv("DATABASE_URL")
 
 # =============== DB INIT =================
@@ -33,6 +34,7 @@ def init_db():
         lang TEXT,
         report_text TEXT,
         result_text TEXT,
+        embedding double precision[],
         created_at TIMESTAMP DEFAULT NOW()
     );
     """)
@@ -49,6 +51,33 @@ def extract_text_from_pdf(pdf_file):
             text += page.get_text()
     return text.strip()
 
+def get_embedding(text):
+    emb = openai.Embedding.create(model="text-embedding-3-small", input=text)
+    return emb["data"][0]["embedding"]
+
+def cosine_similarity(vec1, vec2):
+    v1 = np.array(vec1)
+    v2 = np.array(vec2)
+    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+
+def find_similar_reports(embedding, top_k=3, threshold=0.75):
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT id, report_text, result_text, embedding FROM reports;")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    sims = []
+    for r in rows:
+        if r["embedding"]:
+            sim = cosine_similarity(embedding, r["embedding"])
+            sims.append((sim, r))
+
+    sims.sort(key=lambda x: x[0], reverse=True)
+    similar = [row for score, row in sims if score >= threshold][:top_k]
+    return similar
+
 def build_prompt(text, method, out_lang, feedback=None, similar_cases=None):
     lang_map = {
         "English": "Write the full analysis in clear, professional English.",
@@ -60,7 +89,7 @@ def build_prompt(text, method, out_lang, feedback=None, similar_cases=None):
     if similar_cases:
         extra += "\n\n📌 The AI has detected similar past safety reports:\n"
         for case in similar_cases:
-            extra += f"- {case[:200]}...\n"
+            extra += f"- {case['report_text'][:200]}...\n"
 
     base_prompt = f"""
 You are an aviation safety analyst AI. Analyze the following safety report using the "{method}" method.
@@ -118,12 +147,13 @@ def generate_pdf(current_report, similar_cases, title="Safety Report"):
         story.append(Paragraph("<b>Similar Cases:</b>", styles["Heading2"]))
         for idx, case in enumerate(similar_cases, 1):
             story.append(Paragraph(f"<b>Case {idx}:</b>", styles["Heading3"]))
-            story.append(Paragraph(case.replace("\n", "<br/>"), styles["BodyText"]))
+            story.append(Paragraph(case["result_text"].replace("\n", "<br/>"), styles["BodyText"]))
             story.append(Spacer(1, 12))
 
     doc.build(story)
     buf.seek(0)
     return buf
+
 # ================= FLASK ===================
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret")
@@ -152,8 +182,9 @@ PAGE = """
     {% else %}
       <form hx-post="{{ url_for('analyze') }}" hx-target="#reports" hx-swap="beforeend" enctype="multipart/form-data"
             class="bg-white/10 p-8 rounded-3xl mb-8">
+        <label class="block text-lg font-semibold text-cyan-300 mb-2">Upload PDF</label>
         <input type="file" name="pdf" accept=".pdf" class="mb-4">
-        <div class="flex gap-4">
+        <div class="flex gap-4 mb-4">
           <select name="method" class="flex-1 p-2 bg-slate-800/70">
             <option>Five Whys</option>
             <option>Fishbone</option>
@@ -163,8 +194,8 @@ PAGE = """
             <option>English</option>
             <option>Français</option>
           </select>
-          <button class="px-6 py-3 bg-gradient-to-r from-emerald-400 via-cyan-500 to-blue-500 rounded-xl">🚀 Run Analysis</button>
         </div>
+        <button class="w-full py-3 bg-gradient-to-r from-emerald-400 via-cyan-500 to-blue-500 rounded-xl">🚀 Run Analysis</button>
       </form>
       <div id="reports"></div>
     {% endif %}
@@ -172,7 +203,6 @@ PAGE = """
 </body>
 </html>
 """
-
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(PAGE)
@@ -194,47 +224,59 @@ def analyze():
         return "Unauthorized", 401
 
     pdf_file = request.files["pdf"]
-    method = request.form.get("method","Five Whys")
-    lang = request.form.get("lang","English")
+    method = request.form.get("method", "Five Whys")
+    lang = request.form.get("lang", "English")
     text = extract_text_from_pdf(pdf_file)
 
-    # Benzer olayları bul (çok basit: son 3 raporu benzer kabul ediyoruz)
+    # 1) Embedding hesapla
+    emb = get_embedding(text)
+
+    # 2) DB’den benzer raporları cosine similarity ile bul
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT result_text FROM reports ORDER BY created_at DESC LIMIT 3;")
+    cur.execute("SELECT id, report_text, result_text, embedding FROM reports;")
     rows = cur.fetchall()
-    similar = [r["result_text"] for r in rows]
     cur.close()
     conn.close()
 
-    result = analyze_with_gpt(text, method, lang, similar_cases=similar)
+    similar = []
+    for r in rows:
+        sim = cosine_similarity(emb, r["embedding"])
+        if sim > 0.75:
+            similar.append(r)
 
-    # Kaydet
+    # 3) AI analizi
+    result = analyze_with_gpt(text, method, lang, similar_cases=[r["report_text"] for r in similar])
+
+    # 4) Kaydet
     rid = str(uuid.uuid4())
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
-    cur.execute("INSERT INTO reports (id, method, lang, report_text, result_text) VALUES (%s,%s,%s,%s,%s);",
-                (rid, method, lang, text, result))
+    cur.execute("INSERT INTO reports (id, method, lang, report_text, result_text, embedding) VALUES (%s,%s,%s,%s,%s,%s);",
+                (rid, method, lang, text, result, emb))
     conn.commit()
     cur.close()
     conn.close()
 
-    # HTML blok
+    # 5) HTML blok
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     block = f"""
-    <div class="bg-slate-800/60 p-6 rounded-2xl">
+    <div class="bg-slate-800/60 p-6 rounded-2xl mb-6">
       <div class="flex justify-between mb-3">
         <h2 class="text-xl font-bold text-cyan-300">📄 Report ({method}, {lang})</h2>
         <span class="text-xs">{now}</span>
       </div>
       <a href="{{{{ url_for('download_pdf', report_id='{rid}') }}}}" 
          class="bg-emerald-500 px-3 py-2 rounded-lg text-white">⬇ Download PDF</a>
+      <button hx-post="{{{{ url_for('show_similar') }}}}" hx-vals='{{"report_id":"{rid}"}}'
+              hx-target="#sim-{rid}" class="ml-2 bg-blue-500 px-3 py-2 rounded-lg text-white">🔍 Show Similar Cases</button>
       <pre class="whitespace-pre-wrap text-sm">{result}</pre>
       <form hx-post="{{{{ url_for('feedback') }}}}" hx-target="#reports" hx-swap="beforeend" class="mt-3">
         <input type="hidden" name="report_id" value="{rid}">
         <textarea name="feedback" class="w-full p-2 bg-slate-800/70 rounded-lg" placeholder="Give feedback..."></textarea>
         <button class="bg-cyan-500 px-3 py-2 rounded-lg text-white mt-2">🔁 Update Report</button>
       </form>
+      <div id="sim-{rid}" class="mt-4"></div>
     </div>
     """
     return block
@@ -242,11 +284,11 @@ def analyze():
 @app.route("/feedback", methods=["POST"])
 def feedback():
     rid = request.form.get("report_id")
-    fb = request.form.get("feedback","")
+    fb = request.form.get("feedback", "")
 
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT report_text, method, lang FROM reports WHERE id=%s;", (rid,))
+    cur.execute("SELECT report_text, method, lang, embedding FROM reports WHERE id=%s;", (rid,))
     row = cur.fetchone()
     cur.close()
     conn.close()
@@ -262,16 +304,53 @@ def feedback():
 
     return f"<div class='bg-slate-700 p-4 rounded-lg mt-2'><b>Updated Report:</b><pre>{updated}</pre></div>"
 
+@app.route("/show_similar", methods=["POST"])
+def show_similar():
+    rid = request.form.get("report_id")
+
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT embedding FROM reports WHERE id=%s;", (rid,))
+    row = cur.fetchone()
+    emb = row["embedding"]
+
+    cur.execute("SELECT report_text, result_text, embedding FROM reports WHERE id!=%s;", (rid,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    sims = []
+    for r in rows:
+        sim = cosine_similarity(emb, r["embedding"])
+        if sim > 0.75:
+            sims.append(r)
+
+    if not sims:
+        return "<div class='text-slate-400'>No similar cases found.</div>"
+
+    html = "<div class='bg-slate-700 p-4 rounded-lg mt-3'><b>Similar Cases:</b><ul class='list-disc ml-6'>"
+    for s in sims:
+        html += f"<li><pre class='whitespace-pre-wrap text-sm'>{s['result_text']}</pre></li>"
+    html += "</ul></div>"
+    return html
+
 @app.route("/download/<report_id>")
 def download_pdf(report_id):
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT result_text FROM reports WHERE id=%s;", (report_id,))
+    cur.execute("SELECT result_text, embedding FROM reports WHERE id=%s;", (report_id,))
     row = cur.fetchone()
-    cur.execute("SELECT result_text FROM reports ORDER BY created_at DESC LIMIT 3;")
-    sims = [r["result_text"] for r in cur.fetchall()]
+
+    cur.execute("SELECT result_text, embedding FROM reports WHERE id!=%s;", (report_id,))
+    rows = cur.fetchall()
     cur.close()
     conn.close()
+
+    sims = []
+    for r in rows:
+        sim = cosine_similarity(row["embedding"], r["embedding"])
+        if sim > 0.75:
+            sims.append(r)
 
     pdf = generate_pdf(row["result_text"], sims)
     return send_file(pdf, as_attachment=True, download_name="report.pdf")
