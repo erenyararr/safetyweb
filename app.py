@@ -5,39 +5,35 @@ import datetime
 import os
 import io
 import uuid
+import json
 import psycopg2
 import psycopg2.extras
 import numpy as np
 import re
 
-# --- API key (openai==0.28.1 interface) ---
+# --- API key ---
 from config import API_KEY
 openai.api_key = API_KEY
 
-# User login (hardcoded)
+# Kullanıcı girişi
 USERNAME = "selectsafety"
 PASSWORD = "eren1234"
 
-# Postgres connection (Railway provides DATABASE_URL)
+# DB bağlantısı
 DB_URL = os.getenv("DATABASE_URL")
 
-# Ephemeral PDF storage
-PDF_STORE = {}  # {file_id: (filename, bytes)}
-
-# ======================
-# DB INIT
-# ======================
+# ==================== DB INIT ====================
 def init_db():
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS reports (
+    CREATE TABLE IF NOT EXISTS sreports (
         id UUID PRIMARY KEY,
         method TEXT,
         lang TEXT,
         report_text TEXT,
         result_text TEXT,
-        embedding FLOAT8[],
+        embedding JSONB,
         created_at TIMESTAMP DEFAULT NOW()
     );
     """)
@@ -47,25 +43,13 @@ def init_db():
 
 init_db()
 
-# ======================
-# Helper Functions
-# ======================
-
+# ==================== HELPERS ====================
 def extract_text_from_pdf(pdf_file):
-    """Extract all text from PDF"""
     text = ""
     with fitz.open(stream=pdf_file.read(), filetype="pdf") as doc:
         for page in doc:
             text += page.get_text()
     return text.strip()
-
-def get_embedding(text: str):
-    emb = openai.Embedding.create(model="text-embedding-3-small", input=text)
-    return emb["data"][0]["embedding"]
-
-def cosine_similarity(v1, v2):
-    v1, v2 = np.array(v1), np.array(v2)
-    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
 
 def build_prompt(text, method, out_lang, feedback=None, similar_cases=None):
     lang_map = {
@@ -108,7 +92,16 @@ Here is the full report text:
 """
     if feedback:
         base_prompt += f"\n\n*** Additional Reviewer Feedback to incorporate: ***\n{feedback}\n"
+
     return base_prompt
+
+def get_embedding(text):
+    emb = openai.Embedding.create(model="text-embedding-3-small", input=text)
+    return emb["data"][0]["embedding"]
+
+def cosine_similarity(v1, v2):
+    v1, v2 = np.array(v1), np.array(v2)
+    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
 
 def analyze_with_gpt(text, method="Five Whys", out_lang="English", feedback=None, similar_cases=None):
     resp = openai.ChatCompletion.create(
@@ -118,62 +111,40 @@ def analyze_with_gpt(text, method="Five Whys", out_lang="English", feedback=None
     )
     return resp.choices[0].message.content.strip()
 
-# ---------- Styled PDF Generator ----------
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, HRFlowable
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
+# ==================== PDF EXPORT ====================
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
 
-def _header_footer(canvas, doc):
-    canvas.saveState()
-    canvas.setFont("Helvetica-Bold", 10)
-    canvas.setFillColor(colors.HexColor("#06b6d4"))
-    canvas.drawString(doc.leftMargin, doc.height + doc.topMargin - 10, "✈ AI Safety Report Analyzer")
-    canvas.setFont("Helvetica", 9)
-    canvas.setFillColor(colors.grey)
-    canvas.drawRightString(doc.leftMargin + doc.width, 12, f"Page {doc.page}")
-    canvas.restoreState()
-
-def generate_pdf(current_report, similar_cases=None, title="Safety Report"):
+def generate_pdf(current_report, similar_cases, title="Safety Report"):
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-        leftMargin=18*mm, rightMargin=18*mm, topMargin=20*mm, bottomMargin=16*mm)
-
+    doc = SimpleDocTemplate(buf, pagesize=A4)
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("Title", parent=styles["Heading1"], alignment=TA_CENTER,
-        fontName="Helvetica-Bold", fontSize=18, textColor=colors.HexColor("#22d3ee"))
-    h2 = ParagraphStyle("H2", parent=styles["Heading2"], fontName="Helvetica-Bold",
-        fontSize=14, textColor=colors.HexColor("#38bdf8"))
-    body = ParagraphStyle("Body", parent=styles["BodyText"], fontName="Helvetica",
-        fontSize=10.5, leading=14.5)
+    story = []
 
-    elements = []
-    elements.append(Paragraph(title, title_style))
-    elements.append(HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#0ea5e9"), spaceAfter=8))
+    story.append(Paragraph(f"<b>{title}</b>", styles["Title"]))
+    story.append(Spacer(1, 12))
 
-    elements.append(Paragraph("<b>Current Report:</b>", h2))
-    elements.append(Paragraph(current_report.replace("\n","<br/>"), body))
-    elements.append(Spacer(1, 12))
+    story.append(Paragraph("<b>Current Report:</b>", styles["Heading2"]))
+    story.append(Paragraph(current_report.replace("\n", "<br/>"), styles["BodyText"]))
+    story.append(Spacer(1, 12))
 
     if similar_cases:
-        elements.append(Paragraph("<b>Similar Cases:</b>", h2))
+        story.append(Paragraph("<b>Similar Cases:</b>", styles["Heading2"]))
         for idx, case in enumerate(similar_cases, 1):
-            elements.append(Paragraph(f"<b>Case {idx}:</b>", h2))
-            elements.append(Paragraph(case.replace("\n","<br/>"), body))
-            elements.append(Spacer(1, 10))
+            story.append(Paragraph(f"<b>Case {idx}:</b>", styles["Heading3"]))
+            story.append(Paragraph(case.replace("\n", "<br/>"), styles["BodyText"]))
+            story.append(Spacer(1, 12))
 
-    doc.build(elements, onFirstPage=_header_footer, onLaterPages=_header_footer)
+    doc.build(story)
     buf.seek(0)
-    return buf.read()
+    return buf
 
-# ======================
-# HTML Page
-# ======================
+# ==================== FLASK ====================
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret")
 
+# HTML
 PAGE = """
 <!doctype html>
 <html lang="en">
@@ -183,81 +154,62 @@ PAGE = """
   <title>Safety Analyzer</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/htmx.org@2.0.3"></script>
+  <style>
+    button:active { transform: scale(0.95); }
+    button:hover { opacity: 0.9; }
+  </style>
 </head>
 <body class="min-h-screen bg-gradient-to-br from-slate-900 via-sky-900 to-slate-800 text-slate-200">
 
   <div class="max-w-6xl mx-auto py-10 px-6">
-
     <div class="flex justify-between items-center mb-4">
-      <h1 class="text-4xl font-extrabold bg-gradient-to-r from-cyan-400 via-emerald-400 to-blue-400 bg-clip-text text-transparent drop-shadow-lg">
+      <h1 class="text-4xl font-extrabold bg-gradient-to-r from-cyan-400 via-emerald-400 to-blue-400 bg-clip-text text-transparent">
         ✈️ AI Safety Report Analyzer
       </h1>
-
       {% if session.get('logged_in') %}
         <form action="{{ url_for('logout') }}" method="post">
-          <button class="text-sm bg-rose-500/90 hover:bg-rose-500 px-3 py-2 rounded-lg">Logout</button>
+          <button class="bg-rose-500 px-3 py-2 rounded-lg text-white">Logout</button>
         </form>
       {% endif %}
     </div>
 
     {% if not session.get('logged_in') %}
-      <!-- LOGIN CARD -->
-      <div class="max-w-md mx-auto backdrop-blur-lg bg-white/10 border border-white/20 shadow-2xl p-8 rounded-3xl">
-        <h2 class="text-2xl font-semibold text-center mb-6">Login</h2>
+      <div class="max-w-md mx-auto bg-white/10 p-8 rounded-3xl">
+        <h2 class="text-2xl text-center mb-6">Login</h2>
         <form method="post" action="{{ url_for('login') }}" class="space-y-4">
-          <input name="username" placeholder="Username" class="w-full p-3 rounded-lg bg-slate-800/70 border border-slate-700" required>
-          <input name="password" type="password" placeholder="Password" class="w-full p-3 rounded-lg bg-slate-800/70 border border-slate-700" required>
-          <button class="w-full py-3 rounded-xl font-bold text-white bg-gradient-to-r from-emerald-400 via-cyan-500 to-blue-500 hover:scale-105 transition transform shadow-lg">
-            Sign In
-          </button>
+          <input name="username" placeholder="Username" class="w-full p-3 rounded-lg bg-slate-800/70">
+          <input name="password" type="password" placeholder="Password" class="w-full p-3 rounded-lg bg-slate-800/70">
+          <button class="w-full py-3 bg-gradient-to-r from-emerald-400 via-cyan-500 to-blue-500 rounded-xl">Sign In</button>
         </form>
       </div>
     {% else %}
+      <p class="text-slate-400 mb-10">Analyze reports with AI & see similar past cases</p>
 
-    <p class="text-slate-400 mb-10">Analyze aviation safety reports with AI assistance</p>
-
-    <!-- Upload Form -->
-    <form hx-post="{{ url_for('analyze') }}" hx-target="#reports" hx-swap="beforeend" enctype="multipart/form-data"
-          class="backdrop-blur-lg bg-white/10 border border-white/20 shadow-2xl p-8 rounded-3xl mb-12 space-y-6">
-      
-      <div>
+      <form hx-post="{{ url_for('analyze') }}" hx-target="#reports" hx-swap="beforeend" enctype="multipart/form-data"
+            class="bg-white/10 p-8 rounded-3xl mb-12">
         <label class="block text-lg font-semibold text-cyan-300 mb-2">Upload PDF</label>
-        <input type="file" name="pdf" accept=".pdf" required
-               class="block w-full text-sm text-slate-300 file:mr-4 file:py-2 file:px-4
-                      file:rounded-full file:border-0
-                      file:text-sm file:font-semibold
-                      file:bg-cyan-500 file:text-white
-                      hover:file:bg-cyan-600"/>
-      </div>
+        <input type="file" name="pdf" accept=".pdf" required class="mb-4">
+        <div class="flex gap-4">
+          <select name="method" class="flex-1 p-2 bg-slate-800/70">
+            <option>Five Whys</option>
+            <option>Fishbone</option>
+            <option>Bowtie</option>
+          </select>
+          <select name="lang" class="flex-1 p-2 bg-slate-800/70">
+            <option>English</option>
+            <option>Français</option>
+          </select>
+          <button class="px-6 py-3 bg-gradient-to-r from-emerald-400 via-cyan-500 to-blue-500 rounded-xl">🚀 Run Analysis</button>
+        </div>
+      </form>
 
-      <div class="flex flex-wrap gap-4">
-        <select name="method" class="flex-1 border rounded-lg p-2 bg-slate-800/70 text-slate-200">
-          <option>Five Whys</option>
-          <option>Fishbone</option>
-          <option>Bowtie</option>
-        </select>
-        <select name="lang" class="flex-1 border rounded-lg p-2 bg-slate-800/70 text-slate-200">
-          <option>English</option>
-          <option>Français</option>
-        </select>
-        <button class="px-6 py-3 rounded-xl font-bold text-white bg-gradient-to-r from-emerald-400 via-cyan-500 to-blue-500 hover:scale-105 transition transform shadow-lg">
-          🚀 Run Analysis
-        </button>
-      </div>
-    </form>
-
-    <!-- Reports Output -->
-    <div id="reports" class="space-y-10"></div>
-
+      <div id="reports" class="space-y-10"></div>
     {% endif %}
   </div>
 </body>
 </html>
 """
 
-# ======================
-# Flask Routes
-# ======================
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(PAGE)
@@ -275,72 +227,113 @@ def logout():
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    if not session.get("logged_in"): return "Unauthorized", 401
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
 
     pdf_file = request.files["pdf"]
-    method   = request.form.get("method","Five Whys")
-    lang     = request.form.get("lang","English")
-    text     = extract_text_from_pdf(pdf_file)
-    emb      = get_embedding(text)
+    method = request.form.get("method","Five Whys")
+    lang = request.form.get("lang","English")
+    text = extract_text_from_pdf(pdf_file)
 
-    # Find similar reports
+    # Embedding çıkar
+    emb = get_embedding(text)
+
+    # DB’den tüm raporları çek
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT id, report_text, result_text, embedding FROM reports")
+    cur.execute("SELECT id, report_text, result_text, embedding FROM sreports;")
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
+    # Benzerlikleri hesapla
     similar = []
     for r in rows:
         if r["embedding"]:
-            sim = cosine_similarity(emb, r["embedding"])
-            if sim > 0.75:
-                similar.append(r["result_text"])
+            try:
+                vec = json.loads(r["embedding"])
+                sim = cosine_similarity(emb, vec)
+                if sim > 0.75:
+                    similar.append(r["result_text"])
+            except Exception:
+                continue
 
     result = analyze_with_gpt(text, method, lang, similar_cases=similar)
 
+    # DB’ye kaydet
     rid = str(uuid.uuid4())
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
-    cur.execute("INSERT INTO reports (id, method, lang, report_text, result_text, embedding) VALUES (%s,%s,%s,%s,%s,%s);",
-        (rid, method, lang, text, result, emb))
-    conn.commit(); cur.close(); conn.close()
+    cur.execute("INSERT INTO sreports (id, method, lang, report_text, result_text, embedding) VALUES (%s,%s,%s,%s,%s,%s);",
+                (rid, method, lang, text, result, json.dumps(emb)))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    pdf_bytes = generate_pdf(result, similar_cases=similar)
-    file_id = uuid.uuid4().hex
-    PDF_STORE[file_id] = (f"report_{file_id}.pdf", pdf_bytes)
-    download_url = url_for("download_pdf", file_id=file_id)
-
-    return f"""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    block = f"""
     <div class="bg-slate-800/60 p-6 rounded-2xl">
-      <h2 class="text-xl font-bold text-cyan-300 mb-2">📄 Report ({method}, {lang})</h2>
-      <a href="{download_url}" class="bg-emerald-500 px-3 py-2 rounded-lg text-white">⬇ Download PDF</a>
+      <div class="flex justify-between mb-3">
+        <h2 class="text-xl font-bold text-cyan-300">📄 Report ({method}, {lang})</h2>
+        <span class="text-xs">{now}</span>
+      </div>
+      <a href="{{{{ url_for('download_pdf', report_id='{rid}') }}}}" 
+         class="bg-emerald-500 px-3 py-2 rounded-lg text-white">⬇ Download PDF</a>
       <pre class="whitespace-pre-wrap text-sm">{result}</pre>
-      <form hx-post="{url_for('feedback')}" hx-target="#reports" hx-swap="beforeend" class="mt-3">
+      <form hx-post="{{{{ url_for('feedback') }}}}" hx-target="#reports" hx-swap="beforeend" class="mt-3">
         <input type="hidden" name="report_id" value="{rid}">
         <textarea name="feedback" class="w-full p-2 bg-slate-800/70 rounded-lg" placeholder="Give feedback..."></textarea>
         <button class="bg-cyan-500 px-3 py-2 rounded-lg text-white mt-2">🔁 Update Report</button>
       </form>
     </div>
     """
+    return block
 
 @app.route("/feedback", methods=["POST"])
 def feedback():
     rid = request.form.get("report_id")
-    fb  = request.form.get("feedback","")
+    fb = request.form.get("feedback","")
+
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT report_text, method, lang FROM reports WHERE id=%s;", (rid,))
-    row = cur.fetchone(); cur.close(); conn.close()
-    updated = analyze_with_gpt(row["report_text"], row["method"], row["lang"], feedback=fb)
-    return f"<div class='bg-slate-700 p-4 rounded-lg mt-2'><b>Updated Report:</b><pre>{updated}</pre></div>"
+    cur.execute("SELECT report_text, method, lang FROM sreports WHERE id=%s;", (rid,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
 
-@app.route("/download/<file_id>")
-def download_pdf(file_id):
-    if file_id not in PDF_STORE: return "Not found", 404
-    filename, data = PDF_STORE[file_id]
-    return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+    updated = analyze_with_gpt(row["report_text"], row["method"], row["lang"], feedback=fb)
+
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("UPDATE sreports SET result_text=%s WHERE id=%s;", (updated, rid))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"""
+    <div class="bg-slate-700/70 p-4 rounded-lg mt-3">
+      <div class="flex justify-between mb-2">
+        <h3 class="text-emerald-300 font-bold">🤖 Updated Report</h3>
+        <span class="text-xs text-slate-400">{now}</span>
+      </div>
+      <pre class="whitespace-pre-wrap text-sm">{updated}</pre>
+    </div>
+    """
+
+@app.route("/download/<report_id>")
+def download_pdf(report_id):
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT result_text FROM sreports WHERE id=%s;", (report_id,))
+    row = cur.fetchone()
+    cur.execute("SELECT result_text FROM sreports ORDER BY created_at DESC LIMIT 3;")
+    sims = [r["result_text"] for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    pdf = generate_pdf(row["result_text"], sims)
+    return send_file(pdf, as_attachment=True, download_name="report.pdf")
 
 if __name__ == "__main__":
     app.run(debug=True)
