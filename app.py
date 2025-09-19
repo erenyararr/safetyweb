@@ -6,6 +6,8 @@ import os
 import uuid
 import psycopg2
 import psycopg2.extras
+import numpy as np
+import pickle
 
 # --- API key ---
 from config import API_KEY
@@ -29,7 +31,7 @@ def init_db():
         lang TEXT,
         report_text TEXT,
         result_text TEXT,
-        embedding vector(1536),
+        embedding BYTEA,
         created_at TIMESTAMP DEFAULT NOW()
     );
     """)
@@ -95,6 +97,10 @@ Here is the full report text:
 def get_embedding(text):
     emb = openai.Embedding.create(model="text-embedding-3-small", input=text)
     return emb["data"][0]["embedding"]
+
+def cosine_similarity(vec1, vec2):
+    v1, v2 = np.array(vec1), np.array(vec2)
+    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
 
 def analyze_with_gpt(text, method="Five Whys", out_lang="English", feedback=None, similar_cases=None):
     resp = openai.ChatCompletion.create(
@@ -192,23 +198,37 @@ def analyze():
     lang = request.form.get("lang","English")
     text = extract_text_from_pdf(pdf_file)
 
-    # Similar past reports bul
+    # Embedding al
     emb = get_embedding(text)
+
+    # DB’den tüm raporları al, cosine similarity hesapla
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT report_text, result_text, 1 - (embedding <=> %s) as sim FROM reports ORDER BY sim DESC LIMIT 3;", (emb,))
+    cur.execute("SELECT report_text, result_text, embedding FROM reports;")
     rows = cur.fetchall()
-    similar = [r["report_text"] for r in rows if r["sim"] > 0.75]
+
+    similar = []
+    for r in rows:
+        if r["embedding"] is None:
+            continue
+        past_emb = pickle.loads(r["embedding"])  # bytes → numpy list
+        sim = cosine_similarity(emb, past_emb)
+        if sim > 0.75:
+            similar.append(r["report_text"])
+
     cur.close()
     conn.close()
 
+    # GPT analizi
     result = analyze_with_gpt(text, method, lang, similar_cases=similar)
 
     # Save into DB
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
-    cur.execute("INSERT INTO reports (id, method, lang, report_text, result_text, embedding) VALUES (%s,%s,%s,%s,%s,%s);",
-                (str(uuid.uuid4()), method, lang, text, result, emb))
+    cur.execute(
+        "INSERT INTO reports (id, method, lang, report_text, result_text, embedding) VALUES (%s,%s,%s,%s,%s,%s);",
+        (str(uuid.uuid4()), method, lang, text, result, psycopg2.Binary(pickle.dumps(emb)))
+    )
     conn.commit()
     cur.close()
     conn.close()
