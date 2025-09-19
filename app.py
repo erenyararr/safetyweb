@@ -17,7 +17,7 @@ openai.api_key = API_KEY
 
 # ---------- Auth ----------
 USERNAME = "selectsafety"
-PASSWORD = "eren1234"
+PASSWORD = "eren234"
 
 # ---------- DB ----------
 DB_URL = os.getenv("DATABASE_URL")
