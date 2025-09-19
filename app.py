@@ -54,12 +54,10 @@ def extract_text_from_pdf(pdf_file):
     return text.strip()
 
 def get_embedding(text: str):
-    """OpenAI text-embedding-3-small (1536)"""
     emb = openai.Embedding.create(model="text-embedding-3-small", input=text)
     return emb["data"][0]["embedding"]
 
 def cosine_similarity(v1, v2):
-    """Cosine sim. (güvenli)"""
     a, b = np.asarray(v1, dtype=float), np.asarray(v2, dtype=float)
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
     if na == 0 or nb == 0:
@@ -76,8 +74,28 @@ def tokenize_keywords(t: str):
     tokens = re.findall(r"[a-zA-Z]{3,}", t.lower())
     return [w for w in tokens if w not in STOPWORDS]
 
+def extract_md_section(md: str, header: str) -> str:
+    """
+    Markdown içinde '### {header}' ile başlayan bölümü, bir sonraki başlığa kadar alır.
+    Yoksa boş string döner.
+    """
+    lines = md.splitlines()
+    start, buf = None, []
+    for i, ln in enumerate(lines):
+        if ln.strip().lower() == f"### {header}".lower():
+            start = i + 1
+            break
+    if start is None:
+        return ""
+    for j in range(start, len(lines)):
+        if lines[j].startswith("### "):
+            break
+        buf.append(lines[j])
+    out = "\n".join(buf).strip()
+    # Çok uzun ise kırp
+    return out if len(out) <= 1200 else (out[:1200] + " …")
+    
 def why_similar(current: str, other: str):
-    """Basit anahtar kelime kesişimi ile 1-2 cümlelik açıklama üretir."""
     cur = set(tokenize_keywords(current))
     oth = set(tokenize_keywords(other))
     common = list(cur & oth)
@@ -99,7 +117,7 @@ def build_prompt(report_text, method, out_lang, similar_items=None, feedback=Non
         for i, s in enumerate(similar_items, 1):
             similar_block += (f"- Case {i} (score={s['score']:.2f}): "
                               f"{s['why']}\n"
-                              f"  EXCERPT: {s['snippet']}\n")
+                              f"  CASE INCIDENT SUMMARY: {s.get('incident_summary','(n/a)')}\n")
 
     prompt = f"""
 You are an aviation safety analyst AI. Analyze the following safety report using the "{method}" method.
@@ -239,6 +257,7 @@ PAGE = """
     button:active { transform: scale(0.97); }
     .btn-primary { background:linear-gradient(90deg,#34d399,#22d3ee,#3b82f6); color:white; }
     .btn-primary:hover { filter:brightness(1.05); }
+    a.btn-link { color:#67e8f9; text-decoration:underline; }
   </style>
 </head>
 <body class="min-h-screen bg-gradient-to-br from-slate-900 via-sky-900 to-slate-800 text-slate-200">
@@ -306,29 +325,38 @@ def logout():
     return redirect(url_for("index"))
 
 def render_similar_html(similar_items):
-    """<details> ile benzer olayları listeler."""
+    """Benzer olayları (skor, why, Incident Summary) ve tam rapor linkini gösterir."""
     if not similar_items:
         return '<p class="text-slate-400">No similar cases found.</p>'
-    items_html = []
+    out = []
     for s in similar_items:
-        items_html.append(f"""
-          <div class="p-3 rounded-lg bg-slate-900/50 border border-slate-700">
-            <div class="font-semibold text-cyan-300">Similarity: {s['score']:.2f}</div>
-            <div class="text-sm text-emerald-300 mb-1">Why similar: {html.escape(s['why'])}</div>
-            <div class="text-xs text-slate-300"><b>Snippet:</b> {html.escape(s['snippet'])}</div>
-          </div>
+        inc = s.get("incident_summary") or "(incident summary not available)"
+        out.append(f"""
+        <div class="p-3 rounded-lg bg-slate-900/50 border border-slate-700">
+          <div class="font-semibold text-cyan-300">Similarity: {s['score']:.2f}</div>
+          <div class="text-sm text-emerald-300 mb-1">Why similar: {html.escape(s['why'])}</div>
+          <div class="text-sm text-slate-200 mb-2"><b>Incident Summary (from case):</b> {html.escape(inc)}</div>
+          <div class="text-xs text-slate-400 mb-2"><b>Snippet:</b> {html.escape(s['snippet'])}</div>
+          <a class="btn-link" href="{url_for('view_case', report_id=s['id'])}" target="_blank">Open full report →</a>
+        </div>
         """)
-    return "<div class='space-y-2'>" + "\n".join(items_html) + "</div>"
+    return "<div class='space-y-3'>" + "\n".join(out) + "</div>"
 
-def render_similar_text(similar_items):
-    """PDF için metin bloğu."""
+def render_similar_text(similar_items, include_full=False):
+    """PDF metni: her case için skor, why, Incident Summary; istenirse full rapor da ekler."""
     if not similar_items:
-        return "No similar cases."
+        return "### Similar Cases\nNo similar cases."
     lines = ["### Similar Cases"]
     for i, s in enumerate(similar_items, 1):
-        lines.append(f"- Case {i} | score={s['score']:.2f}")
-        lines.append(f"  Why similar: {s['why']}")
-        lines.append(f"  Snippet: {s['snippet']}")
+        lines.append(f"## Case {i} — score={s['score']:.2f}")
+        lines.append(f"Why similar: {s['why']}")
+        if s.get("incident_summary"):
+            lines.append("**Incident Summary (from case)**")
+            lines.append(s["incident_summary"])
+        if include_full and s.get("full_result"):
+            lines.append("\n**Full Case Report**")
+            lines.append(s["full_result"])
+        lines.append("\n---\n")
     return "\n".join(lines)
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -342,7 +370,7 @@ def analyze():
     report_text = extract_text_from_pdf(pdf)
     emb = get_embedding(report_text)
 
-    # DB'den bütün kayıtları çek → cosine ile sırala
+    # DB: son 200 kaydı çek
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT id, report_text, result_text, embedding FROM sreports ORDER BY created_at DESC LIMIT 200;")
@@ -364,18 +392,22 @@ def analyze():
             score = cosine_similarity(emb, vec)
         except Exception:
             continue
+        why = why_similar(report_text, r["report_text"] or r["result_text"] or "")
+        full_result = r["result_text"] or ""
+        inc_summary = extract_md_section(full_result, "Incident Summary")
         sims.append({
             "id": str(r["id"]),
             "score": score,
-            "why": why_similar(report_text, r["report_text"] or r["result_text"] or ""),
-            "snippet": (r["report_text"] or r["result_text"] or "")[:220].replace("\n"," ") + ("..." if (r["report_text"] or r["result_text"]) and len((r["report_text"] or r["result_text"]))>220 else "")
+            "why": why,
+            "snippet": (r["report_text"] or r["result_text"] or "")[:220].replace("\n"," ") + ("..." if (r["report_text"] or r["result_text"]) and len((r["report_text"] or r["result_text"]))>220 else ""),
+            "incident_summary": inc_summary,
+            "full_result": full_result
         })
 
-    # En iyi 5 ve threshold
     sims = sorted(sims, key=lambda x: x["score"], reverse=True)
     sims = [s for s in sims if s["score"] >= 0.70][:5]
 
-    # GPT analizi (benzerleri prompta kat)
+    # GPT analizi
     result_text = analyze_with_gpt(report_text, method, lang, similar_items=sims)
 
     # DB'ye kaydet
@@ -390,12 +422,15 @@ def analyze():
     cur.close()
     conn.close()
 
-    # PDF içeriklerini hazırla (tek rapor & rapor+similar)
+    # PDF içerikleri
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    pdf_one = f"# Safety Report — {method} — {lang}\n\n{result_text}"
-    pdf_full = f"# Safety Report — {method} — {lang}\n\n{result_text}\n\n{render_similar_text(sims)}"
-    b64_one = base64.b64encode(pdf_one.encode("utf-8")).decode("ascii")
-    b64_full = base64.b64encode(pdf_full.encode("utf-8")).decode("ascii")
+    pdf_only = f"# Safety Report — {method} — {lang}\n\n{result_text}"
+    pdf_with_sim = (
+        f"# Safety Report — {method} — {lang}\n\n{result_text}\n\n" +
+        render_similar_text(sims, include_full=True)
+    )
+    b64_only = base64.b64encode(pdf_only.encode("utf-8")).decode("ascii")
+    b64_with = base64.b64encode(pdf_with_sim.encode("utf-8")).decode("ascii")
 
     similar_html = render_similar_html(sims)
 
@@ -408,12 +443,12 @@ def analyze():
 
       <div class="flex gap-3 mb-3 flex-wrap">
         <form action="{url_for('download_pdf')}" method="post" target="_blank">
-          <input type="hidden" name="content_b64" value="{b64_one}">
+          <input type="hidden" name="content_b64" value="{b64_only}">
           <input type="hidden" name="title" value="Safety Report — {method} — {lang}">
           <button class="px-3 py-2 rounded-lg bg-emerald-600 hover:brightness-110 text-white text-sm">⬇ Download PDF (report)</button>
         </form>
         <form action="{url_for('download_pdf')}" method="post" target="_blank">
-          <input type="hidden" name="content_b64" value="{b64_full}">
+          <input type="hidden" name="content_b64" value="{b64_with}">
           <input type="hidden" name="title" value="Safety Report + Similar — {method} — {lang}">
           <button class="px-3 py-2 rounded-lg bg-teal-600 hover:brightness-110 text-white text-sm">⬇ Download PDF (report + similar)</button>
         </form>
@@ -438,6 +473,46 @@ def analyze():
     </div>
     """
     return block
+@app.route("/case/<report_id>")
+def view_case(report_id):
+    """Benzer olaya tıklanınca tam raporu yeni sekmede gösterir + tek başına PDF indirir."""
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT method, lang, result_text, created_at FROM sreports WHERE id=%s;", (report_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if not row:
+        return "Not found", 404
+    method, lang, result_text, created_at = row["method"], row["lang"], row["result_text"], row["created_at"]
+    title = f"Case {report_id[:8]} — {method} — {lang}"
+    b64 = base64.b64encode(f"# {title}\n\n{result_text}".encode("utf-8")).decode("ascii")
+    html_page = f"""
+    <html><head>
+      <meta charset="utf-8"/>
+      <title>{html.escape(title)}</title>
+      <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+      <style> body{{background:#0b1220;color:#d1e7ff;font-family:system-ui,Arial,sans-serif;padding:28px}}
+      .card{{background:#0f172a;border:1px solid #1f2a44;border-radius:14px;padding:20px}}
+      .btn{{display:inline-block;background:#10b981;color:#fff;padding:8px 12px;border-radius:10px;text-decoration:none}}
+      pre{{white-space:pre-wrap;background:#0b1020;border:1px solid #253454;padding:12px;border-radius:10px}}
+      </style>
+    </head><body>
+      <div class="card">
+        <h2>{html.escape(title)}</h2>
+        <div style="font-size:12px;opacity:.7;margin-bottom:8px;">Created: {created_at}</div>
+        <form action="{url_for('download_pdf')}" method="post" target="_blank" style="margin-bottom:10px;">
+          <input type="hidden" name="content_b64" value="{b64}">
+          <input type="hidden" name="title" value="{html.escape(title)}">
+          <button class="btn">⬇ Download PDF</button>
+        </form>
+        <pre>{html.escape(result_text)}</pre>
+      </div>
+    </body></html>
+    """
+    return html_page
+
 @app.route("/feedback", methods=["POST"])
 def feedback():
     if not session.get("logged_in"):
@@ -457,14 +532,13 @@ def feedback():
 
     updated = analyze_with_gpt(text, method, lang, similar_items=similar_items, feedback=fb)
 
-    # PDF’ler: sadece updated & full (orig+updated+similar)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     pdf_updated = f"# Updated Safety Report — {method} — {lang}\n\n{updated}"
     pdf_full = (
         f"# Full Package — {method} — {lang}\n\n"
         f"### Original Report\n{orig}\n\n"
-        f"### Updated Report (with feedback)\n{updated}\n\n"
-        f"{render_similar_text(similar_items)}"
+        f"### Updated Report (with feedback)\n{updated}\n\n" +
+        render_similar_text(similar_items, include_full=True)
     )
     b64_updated = base64.b64encode(pdf_updated.encode("utf-8")).decode("ascii")
     b64_full = base64.b64encode(pdf_full.encode("utf-8")).decode("ascii")
@@ -501,7 +575,7 @@ def feedback():
     """
     return block
 
-# Stateless PDF indirme — her zaman POST ile içerikten üretir (404 olmaz)
+# Stateless PDF indirme — içerikten üretir (404 yok)
 @app.route("/download", methods=["POST"])
 def download_pdf():
     if not session.get("logged_in"):
