@@ -35,7 +35,7 @@ def init_db():
     );
     """)
 
-    # Kullanıcılar (manuel dolduracaksın)
+    # Kullanıcılar
     cur.execute("""
     CREATE TABLE IF NOT EXISTS susers (
         id UUID PRIMARY KEY,
@@ -46,25 +46,25 @@ def init_db():
         created_at TIMESTAMP DEFAULT NOW()
     );
     """)
-    # Admin sütunu (varsa eklemez)
     cur.execute("ALTER TABLE susers ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE;")
 
-    # ---- Aktivite Log tablosu ----
+    # Activity log
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS sactivity (
+    CREATE TABLE IF NOT EXISTS activity_log (
         id UUID PRIMARY KEY,
         user_id UUID,
         username TEXT,
-        action TEXT NOT NULL,
+        action TEXT NOT NULL,            -- login, logout, analyze, download_report, download_full, updated_report, download_updated
         report_id UUID,
-        extra JSONB,
+        title TEXT,
         ip TEXT,
         user_agent TEXT,
+        extra JSONB,
         created_at TIMESTAMP DEFAULT NOW()
     );
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS sactivity_created_at_idx ON sactivity (created_at DESC);")
-    cur.execute("CREATE INDEX IF NOT EXISTS sactivity_user_idx ON sactivity (username);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_log(created_at DESC);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_log(username);")
 
     conn.commit()
     cur.close()
@@ -72,32 +72,6 @@ def init_db():
 
 init_db()
 
-# ---- Audit helper ----
-def log_event(action: str, report_id: str = None, extra: dict = None):
-    try:
-        conn = psycopg2.connect(DB_URL, sslmode="require")
-        cur = conn.cursor()
-        ip = request.headers.get("X-Forwarded-For") or request.remote_addr or ""
-        ua = request.headers.get("User-Agent") or ""
-        cur.execute(
-            "INSERT INTO sactivity (id, user_id, username, action, report_id, extra, ip, user_agent) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s);",
-            (
-                uuid.uuid4(),
-                session.get("user_id"),
-                session.get("username"),
-                action,
-                report_id,
-                json.dumps(extra or {}),
-                ip,
-                ua
-            )
-        )
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception:
-        # log yazımı hiçbir zaman kullanıcı akışını bozmasın
-        pass
 # ---------- Helpers ----------
 STOP = set("""
 the and for with that this from into over under across about above below between during after before while would could
@@ -136,13 +110,15 @@ def incident_summary_from_markdown(md: str) -> str:
     return m.group(1).strip()
 
 def build_why_similar(curr_text: str, past_text: str, overlap_terms, sim_score: float) -> str:
-    # İnsan gibi kısa yorum + uyarı
+    """İnsan gibi açıklama + uyarı."""
     if overlap_terms:
-        because = f"These two reports look alike because they emphasize similar factors — {', '.join(overlap_terms[:6])} — pointing to comparable failure modes."
+        because = f"they both center on {', '.join(overlap_terms[:3])} and show a comparable pattern of contributing factors"
     else:
-        because = "These two reports look alike because the event phase and contributing factors align at a high level, suggesting comparable failure modes."
-    warn = "Still, details may differ (aircraft, airport, crew, weather) — treat this as directional, not prescriptive."
-    return f"{because} Similarity ≈ {sim_score:.2f}. {warn}"
+        because = "they share a comparable sequence of contributing factors during a similar operational phase"
+    warn = ("Contexts may differ (aircraft, airport, crew, weather); use these parallels to inspire mitigations, "
+            "not as one-to-one prescriptions.")
+    return (f"These two reports are similar because {because}. "
+            f"Approximate similarity score: {sim_score:.2f}. {warn}")
 
 def build_prompt(text, method, out_lang, feedback=None, similar_cases=None):
     lang_map = {
@@ -227,6 +203,7 @@ def _mk_styles():
     body = ParagraphStyle("Body", parent=styles["BodyText"], fontName="Helvetica",
                           fontSize=10.5, leading=14.5, spaceAfter=6)
     return title_style, h2, body
+
 def _render_simple_markdown(elements, markdown_text, h2, body):
     lines = [ln.rstrip() for ln in markdown_text.splitlines()]
     i, para_buf = 0, []
@@ -304,7 +281,6 @@ def generate_pdf_full(current_markdown, similar_list, title="Safety Report (with
     doc.build(els, onFirstPage=_header_footer, onLaterPages=_header_footer)
     buf.seek(0)
     return buf
-
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret")
 
@@ -329,17 +305,16 @@ PAGE = """
       <h1 class="text-4xl font-extrabold bg-gradient-to-r from-cyan-400 via-emerald-400 to-blue-400 bg-clip-text text-transparent">
         ✈️ AI Safety Report Analyzer
       </h1>
-      {% if session.get('logged_in') %}
-        <div class="flex items-center gap-2">
-          {% if session.get('is_admin') %}
-            <a href="{{ url_for('admin_home') }}"
-               class="bg-amber-500 px-3 py-2 rounded-lg text-white">Admin</a>
-          {% endif %}
+      <div class="flex items-center gap-3">
+        {% if session.get('is_admin') %}
+          <a class="text-sky-300 underline" href="{{ url_for('admin') }}">Admin</a>
+        {% endif %}
+        {% if session.get('logged_in') %}
           <form action="{{ url_for('logout') }}" method="post">
             <button class="bg-rose-500 px-3 py-2 rounded-lg text-white">Logout</button>
           </form>
-        </div>
-      {% endif %}
+        {% endif %}
+      </div>
     </div>
 
     {% if not session.get('logged_in') %}
@@ -354,7 +329,6 @@ PAGE = """
     {% else %}
       <p class="text-slate-400 mb-10">Upload a PDF, we'll find similar cases, and draft an analysis. You can send feedback and re-generate.</p>
 
-      <!-- Upload form -->
       <form hx-post="{{ url_for('analyze') }}" hx-target="#reports" hx-swap="beforeend" enctype="multipart/form-data"
             class="bg-white/10 p-8 rounded-3xl mb-12 space-y-6">
 
@@ -365,7 +339,9 @@ PAGE = """
                    class="absolute inset-0 w-full h-full opacity-0 cursor-pointer" required
                    onchange="document.getElementById('fileName').textContent=this.files?.[0]?.name||'No file chosen'">
             <button type="button" class="px-4 py-2 rounded-lg text-white"
-                    style="background:linear-gradient(90deg,#34d399,#22d3ee,#3b82f6);">📄 Choose File</button>
+                    style="background:linear-gradient(90deg,#34d399,#22d3ee,#3b82f6);">
+              📄 Choose File
+            </button>
             <span id="fileName" class="ml-3 text-sm text-slate-300">No file chosen</span>
           </div>
         </div>
@@ -390,6 +366,210 @@ PAGE = """
 </body>
 </html>
 """
+
+ADMIN_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Admin — Safety Analyzer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>.chip{padding:.2rem .5rem;border-radius:.5rem;font-size:.75rem}</style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-200">
+  <div class="max-w-7xl mx-auto p-6">
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-3xl font-extrabold bg-gradient-to-r from-cyan-400 via-emerald-400 to-blue-400 bg-clip-text text-transparent">🛡️ Admin Panel</h1>
+      <a href="{{ url_for('index') }}" class="text-sky-300 underline">← Back</a>
+    </div>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+      <div class="bg-slate-900/70 p-4 rounded-xl border border-white/10">
+        <div class="text-slate-400 text-sm">Total Users</div>
+        <div class="text-2xl font-bold">{{ users|length }}</div>
+      </div>
+      <div class="bg-slate-900/70 p-4 rounded-xl border border-white/10">
+        <div class="text-slate-400 text-sm">Total Reports</div>
+        <div class="text-2xl font-bold">{{ total_reports }}</div>
+      </div>
+      <div class="bg-slate-900/70 p-4 rounded-xl border border-white/10">
+        <div class="text-slate-400 text-sm">Analyses (24h)</div>
+        <div class="text-2xl font-bold">{{ kpi_analyses_24h }}</div>
+      </div>
+      <div class="bg-slate-900/70 p-4 rounded-xl border border-white/10">
+        <div class="text-slate-400 text-sm">Downloads (24h)</div>
+        <div class="text-2xl font-bold">{{ kpi_downloads_24h }}</div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div class="lg:col-span-1 bg-slate-900/70 rounded-xl border border-white/10">
+        <div class="p-4 border-b border-white/10"><div class="font-semibold">Users</div></div>
+        <div class="p-4 overflow-x-auto">
+          <table class="min-w-full text-sm">
+            <thead class="text-slate-400">
+              <tr>
+                <th class="text-left pb-2">User</th>
+                <th class="text-left pb-2">Roles</th>
+                <th class="text-right pb-2">Login</th>
+                <th class="text-right pb-2">Analyze</th>
+                <th class="text-right pb-2">DL Report</th>
+                <th class="text-right pb-2">DL Similar</th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for u in users %}
+              <tr class="border-t border-white/10">
+                <td class="py-2">
+                  <div class="font-medium">{{ u.username }}</div>
+                  <div class="text-xs text-slate-400">{{ u.created_at.strftime('%Y-%m-%d') }}</div>
+                </td>
+                <td class="py-2">
+                  {% if u.is_admin %}<span class="chip bg-amber-500/20 text-amber-300">Admin</span>{% endif %}
+                  {% if u.can_see_similar %}<span class="chip bg-emerald-500/20 text-emerald-300">Similar</span>{% else %}<span class="chip bg-slate-700 text-slate-300">No Similar</span>{% endif %}
+                  {% if u.is_active %}<span class="chip bg-cyan-500/20 text-cyan-300">Active</span>{% else %}<span class="chip bg-rose-500/20 text-rose-300">Disabled</span>{% endif %}
+                </td>
+                <td class="py-2 text-right">{{ stats[u.username].login or 0 }}</td>
+                <td class="py-2 text-right">{{ stats[u.username].analyze or 0 }}</td>
+                <td class="py-2 text-right">{{ stats[u.username].download_report or 0 }}</td>
+                <td class="py-2 text-right">{{ stats[u.username].download_full or 0 }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="lg:col-span-2 bg-slate-900/70 rounded-xl border border-white/10">
+        <div class="p-4 border-b border-white/10 flex items-center justify-between">
+          <div class="font-semibold">Recent Activity (last {{ activities|length }})</div>
+          <form method="get" class="text-sm">
+            <input name="user" placeholder="Filter by username" value="{{ q_user or '' }}"
+                   class="bg-slate-800/80 rounded px-2 py-1">
+            <button class="ml-2 px-3 py-1 rounded bg-sky-600 text-white">Filter</button>
+          </form>
+        </div>
+        <div class="p-4">
+          <ol class="relative border-l border-slate-700 ml-3">
+            {% for a in activities %}
+            <li class="mb-6 ml-4">
+              <div class="absolute -left-1.5 w-3 h-3 rounded-full {% if 'download' in a.action %}bg-emerald-400{% elif a.action=='analyze' %}bg-cyan-400{% elif a.action=='login' %}bg-amber-400{% else %}bg-slate-400{% endif %}"></div>
+              <div class="text-sm">
+                <span class="font-semibold">{{ a.username or '—' }}</span>
+                <span class="text-slate-400">→ {{ a.action.replace('_',' ').title() }}</span>
+                {% if a.title %}<span class="text-slate-300"> — {{ a.title }}</span>{% endif %}
+                {% if a.report_id %}<a class="text-sky-300 underline" target="_blank" href="{{ url_for('case_fullpage', case_id=a.report_id) }}">(open)</a>{% endif %}
+              </div>
+              <div class="text-xs text-slate-400">{{ a.created_at.strftime('%Y-%m-%d %H:%M') }} • IP {{ a.ip or '—' }}</div>
+            </li>
+            {% endfor %}
+          </ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+def _fetch_all_reports():
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT id, report_text, result_text, embedding FROM sreports ORDER BY created_at DESC LIMIT 1000;")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or ""
+
+def log_event(action, report_id=None, title=None, extra=None, username=None):
+    try:
+        uid = session.get("user_id")
+        uname = username or session.get("username")
+        ua = (request.headers.get("User-Agent") or "")[:300]
+        ip = _client_ip()
+        conn = psycopg2.connect(DB_URL, sslmode="require")
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO activity_log (id, user_id, username, action, report_id, title, ip, user_agent, extra) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+            (str(uuid.uuid4()), uid, uname, action, report_id, title, ip, ua, json.dumps(extra or {}))
+        )
+        conn.commit()
+        cur.close(); conn.close()
+    except Exception:
+        pass
+
+@app.route("/admin")
+def admin():
+    if not session.get("logged_in") or not session.get("is_admin"):
+        return "Forbidden", 403
+
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT id, username, can_see_similar, is_active, is_admin, created_at FROM susers ORDER BY created_at;")
+    users = cur.fetchall()
+
+    q_user = request.args.get("user", "").strip() or None
+    if q_user:
+        cur.execute("""
+            SELECT id, username, action, report_id, title, ip, created_at
+            FROM activity_log
+            WHERE username=%s
+            ORDER BY created_at DESC
+            LIMIT 300;
+        """, (q_user,))
+    else:
+        cur.execute("""
+            SELECT id, username, action, report_id, title, ip, created_at
+            FROM activity_log
+            ORDER BY created_at DESC
+            LIMIT 300;
+        """)
+    activities = cur.fetchall()
+
+    cur.execute("SELECT COUNT(1) FROM sreports;")
+    total_reports = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT
+          SUM(CASE WHEN action='analyze' THEN 1 ELSE 0 END) AS analyzes,
+          SUM(CASE WHEN action LIKE 'download%%' THEN 1 ELSE 0 END) AS downloads
+        FROM activity_log
+        WHERE created_at >= NOW() - INTERVAL '24 hours';
+    """)
+    r = cur.fetchone()
+    kpi_analyses_24h = r[0] or 0
+    kpi_downloads_24h = r[1] or 0
+
+    stats = {}
+    for u in users:
+        stats[u["username"]] = {"login":0,"analyze":0,"download_report":0,"download_full":0}
+    cur.execute("SELECT username, action, COUNT(1) AS c FROM activity_log GROUP BY username, action;")
+    for row in cur.fetchall():
+        uname = row["username"] or ""
+        if uname not in stats:
+            stats[uname] = {"login":0,"analyze":0,"download_report":0,"download_full":0}
+        act = row["action"]
+        if act in stats[uname]:
+            stats[uname][act] = row["c"]
+
+    cur.close(); conn.close()
+
+    return render_template_string(
+        ADMIN_PAGE,
+        users=users,
+        activities=activities,
+        stats=stats,
+        total_reports=total_reports,
+        kpi_analyses_24h=kpi_analyses_24h,
+        kpi_downloads_24h=kpi_downloads_24h,
+        q_user=q_user
+    )
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(PAGE)
@@ -405,18 +585,16 @@ def login():
     row = cur.fetchone()
     cur.close(); conn.close()
 
-    if row and row["is_active"] and row["password"] == password:
+    ok = bool(row and row["is_active"] and row["password"] == password)
+    if ok:
         session["logged_in"] = True
         session["user_id"] = str(row["id"])
         session["username"] = username
         session["can_see_similar"] = bool(row["can_see_similar"])
         session["is_admin"] = bool(row["is_admin"])
-        log_event("login_success")
+        log_event("login", extra={"success": True})
     else:
-        # kullanıcı adı girilmişse de logluyoruz (şifreyi ASLA yazma)
-        session["username"] = username or None
-        log_event("login_failed")
-        session.pop("username", None)
+        log_event("login", extra={"success": False}, username=username)
     return redirect(url_for("index"))
 
 @app.route("/logout", methods=["POST"])
@@ -429,14 +607,6 @@ def logout():
     session.pop("is_admin", None)
     return redirect(url_for("index"))
 
-def _fetch_all_reports():
-    conn = psycopg2.connect(DB_URL, sslmode="require")
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT id, report_text, result_text, embedding FROM sreports ORDER BY created_at DESC LIMIT 1000;")
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-    return rows
-
 @app.route("/analyze", methods=["POST"])
 def analyze():
     if not session.get("logged_in"):
@@ -446,8 +616,6 @@ def analyze():
     method   = request.form.get("method","Five Whys")
     lang     = request.form.get("lang","English")
     text     = extract_text_from_pdf(pdf_file)
-
-    log_event("analyze_start", extra={"method": method, "lang": lang})
 
     q_emb = get_embedding(text)
     curr_terms = top_keywords(text)
@@ -482,10 +650,8 @@ def analyze():
                 (rid, method, lang, text, result, json.dumps(q_emb)))
     conn.commit(); cur.close(); conn.close()
 
-    log_event("analyze_saved", report_id=rid, extra={
-        "method": method, "lang": lang,
-        "similar_top": [{"id": c["id"], "sim": round(float(c["sim"]), 4)} for c in similar_cases]
-    })
+    title = f"Safety Report — {method} — {lang}"
+    log_event("analyze", report_id=rid, title=title, extra={"method": method, "lang": lang, "similar_count": len(similar_cases)})
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     sim_target = f"sim-{rid}"
@@ -533,7 +699,6 @@ def analyze():
 
 @app.route("/similar/<report_id>")
 def similar_cases(report_id):
-    # Mevcut raporu al
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT report_text, result_text, embedding FROM sreports WHERE id=%s;", (report_id,))
@@ -564,9 +729,7 @@ def similar_cases(report_id):
                 pass
 
     items.sort(key=lambda x: -x[0])
-    items = items[:5]  # UI'da da en iyi 5
-
-    log_event("view_similar", report_id=report_id, extra={"count": len(items)})
+    items = items[:5]
 
     if not items:
         return "<div class='text-slate-300'>No close matches found.</div>"
@@ -580,8 +743,7 @@ def similar_cases(report_id):
           <div class="text-emerald-200 text-sm mb-1"><b>Why similar:</b> {why}</div>
           <div class="text-slate-300 text-sm"><b>Snippet:</b> {summ[:500]}</div>
           <div class="mt-2">
-            <a href="{url_for('case_fullpage', case_id=cid)}" target="_blank"
-               class="text-sky-300 underline">Open full case in new tab</a>
+            <a href="{url_for('case_fullpage', case_id=cid)}" target="_blank" class="text-sky-300 underline">Open full case in new tab</a>
             <button class="ml-3 px-2 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600"
                     hx-get="{url_for('case_preview', case_id=cid)}"
                     hx-target="#prev-{cid}" hx-swap="innerHTML">Preview here</button>
@@ -593,7 +755,6 @@ def similar_cases(report_id):
     return "\n".join(html)
 @app.route("/case/preview/<case_id>")
 def case_preview(case_id):
-    log_event("case_preview", report_id=case_id)
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT result_text FROM sreports WHERE id=%s;", (case_id,))
@@ -605,7 +766,6 @@ def case_preview(case_id):
 
 @app.route("/case/<case_id>")
 def case_fullpage(case_id):
-    log_event("case_fullpage", report_id=case_id)
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT result_text FROM sreports WHERE id=%s;", (case_id,))
@@ -628,12 +788,56 @@ def feedback():
 
     updated = analyze_with_gpt(text, method, lang, feedback=fb)
 
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    pdf_buf = generate_pdf_report(updated, title=f"Updated Safety Report — {method} — {lang}")
-    file_id = uuid.uuid4().hex
-    _PDF_STORE[file_id] = (f"updated_report_{file_id}.pdf", pdf_buf.getvalue())
+    # Similar listesi (updated + similar PDF için)
+    q_emb = get_embedding(text)
+    curr_terms = top_keywords(text)
+    sims = []
+    for r in _fetch_all_reports():
+        if str(r["id"]) == rid:
+            continue
+        if r["embedding"]:
+            try:
+                vec = json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
+                sim = cosine_similarity(q_emb, vec)
+                if sim >= 0.60:
+                    past_txt = r["report_text"] or ""
+                    overlap = list(set(curr_terms) & set(top_keywords(past_txt)))
+                    why = build_why_similar(text, past_txt, overlap, sim)
+                    summ = incident_summary_from_markdown(r["result_text"] or r["report_text"] or "")
+                    sims.append({
+                        "id": str(r["id"]),
+                        "sim": sim,
+                        "snippet": summ or past_txt[:220],
+                        "why": why,
+                        "full_markdown": r["result_text"] or ""
+                    })
+            except Exception:
+                pass
+    sims.sort(key=lambda x: -x["sim"])
+    sims = sims[:5]
 
-    log_event("feedback_update", report_id=rid, extra={"file_id": file_id})
+    # PDF'leri hazırla (in-memory store)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    pdf_only = generate_pdf_report(updated, title=f"Updated Safety Report — {method} — {lang}")
+    file_id_only = uuid.uuid4().hex
+    _PDF_STORE[file_id_only] = {"filename": f"updated_report_{file_id_only}.pdf",
+                                "bytes": pdf_only.getvalue(),
+                                "requires_similar_permission": False}
+
+    pdf_full = generate_pdf_full(updated, sims, title="Updated Safety Report (with Similar Cases)")
+    file_id_full = uuid.uuid4().hex
+    _PDF_STORE[file_id_full] = {"filename": f"updated_report_with_similar_{file_id_full}.pdf",
+                                "bytes": pdf_full.getvalue(),
+                                "requires_similar_permission": True}
+
+    log_event("updated_report", report_id=rid, title=f"Updated — {method}/{lang}", extra={"similar_count": len(sims)})
+
+    sim_btn = ""
+    if session.get("can_see_similar", True) or session.get("is_admin", False):
+        sim_btn = f"""
+        <a class="px-3 py-2 rounded-lg bg-sky-600/90 hover:bg-sky-600 text-white text-sm"
+           href="{url_for('download_memory_pdf', file_id=file_id_full)}">⬇ Download PDF (updated + similar)</a>
+        """
 
     block = f"""
     <div class="bg-slate-700/70 p-4 rounded-2xl border border-white/10">
@@ -641,21 +845,21 @@ def feedback():
         <h3 class="text-emerald-300 font-bold">🤖 Updated Report</h3>
         <span class="text-xs text-slate-400">{now}</span>
       </div>
-      <div class="mb-2">
+      <div class="mb-2 flex gap-2">
         <a class="px-3 py-2 rounded-lg bg-emerald-600/90 hover:bg-emerald-600 text-white text-sm"
-           href="{url_for('download_memory_pdf', file_id=file_id)}">⬇ Download PDF (updated)</a>
+           href="{url_for('download_memory_pdf', file_id=file_id_only)}">⬇ Download PDF (updated)</a>
+        {sim_btn}
       </div>
       <pre class="whitespace-pre-wrap text-sm bg-slate-900/60 p-3 rounded border border-slate-700">{updated}</pre>
     </div>
     """
     return block
 
-# In-memory store for updated downloads
-_PDF_STORE = {}  # {file_id: (filename, bytes)}
+# In-memory store
+_PDF_STORE = {}  # file_id -> {"filename": str, "bytes": bytes, "requires_similar_permission": bool}
 
 @app.route("/download/report/<report_id>")
 def download_report(report_id):
-    log_event("download_report", report_id=report_id)
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT result_text, method, lang FROM sreports WHERE id=%s;", (report_id,))
@@ -663,20 +867,22 @@ def download_report(report_id):
     cur.close(); conn.close()
     if not row:
         return "Not found", 404
-    pdf = generate_pdf_report(row["result_text"], title=f"Safety Report — {row['method']} — {row['lang']}")
+
+    title = f"Safety Report — {row['method']} — {row['lang']}"
+    log_event("download_report", report_id=report_id, title=title)
+
+    pdf = generate_pdf_report(row["result_text"], title=title)
     return send_file(pdf, as_attachment=True, download_name="report.pdf")
 
 @app.route("/download/full/<report_id>")
 def download_full(report_id):
-    # İzin durumunu da logla (politikanı daha önce düzelttiysen burada 403 da atabilirsin)
-    log_event("download_full_request", report_id=report_id, extra={
-        "can_see_similar": session.get("can_see_similar", None),
-        "is_admin": session.get("is_admin", None)
-    })
+    if not session.get("can_see_similar", True) and not session.get("is_admin", False):
+        log_event("download_full_denied", report_id=report_id, extra={"reason":"permission"})
+        return "Forbidden", 403
 
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT report_text, result_text, embedding FROM sreports WHERE id=%s;", (report_id,))
+    cur.execute("SELECT report_text, result_text, embedding, method, lang FROM sreports WHERE id=%s;", (report_id,))
     row = cur.fetchone()
     cur.close(); conn.close()
     if not row:
@@ -712,93 +918,24 @@ def download_full(report_id):
     sims.sort(key=lambda x: -x["sim"])
     sims = sims[:5]
 
-    log_event("download_full_generated", report_id=report_id, extra={"similar_count": len(sims)})
+    title = f"Safety Report — {row['method']} — {row['lang']}"
+    log_event("download_full", report_id=report_id, title=title, extra={"similar_count": len(sims)})
 
     pdf = generate_pdf_full(current_md, sims, title="Safety Report (with Similar Cases)")
     return send_file(pdf, as_attachment=True, download_name="report_with_similar.pdf")
 
 @app.route("/download/memory/<file_id>")
 def download_memory_pdf(file_id):
-    log_event("download_updated_memory", extra={"file_id": file_id})
-    if file_id not in _PDF_STORE:
+    rec = _PDF_STORE.get(file_id)
+    if not rec:
         return "Not found", 404
-    fname, data = _PDF_STORE[file_id]
-    return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=fname)
-
-# ----- Admin panel (kullanıcılar, raporlar, aktiviteler) -----
-@app.route("/admin")
-def admin_home():
-    if not session.get("is_admin"):
+    if rec.get("requires_similar_permission") and not (session.get("can_see_similar", True) or session.get("is_admin", False)):
+        log_event("download_updated_denied", extra={"reason": "permission"})
         return "Forbidden", 403
 
-    conn = psycopg2.connect(DB_URL, sslmode="require")
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-    # Kullanıcılar
-    cur.execute("SELECT username, is_active, can_see_similar, is_admin, created_at FROM susers ORDER BY created_at DESC;")
-    users = cur.fetchall()
-
-    # Son 30 rapor
-    cur.execute("SELECT id, method, lang, created_at FROM sreports ORDER BY created_at DESC LIMIT 30;")
-    reports = cur.fetchall()
-
-    # Son 200 aktivite
-    cur.execute("""
-        SELECT created_at, username, action, report_id, ip, extra
-        FROM sactivity
-        ORDER BY created_at DESC
-        LIMIT 200;
-    """)
-    acts = cur.fetchall()
-    cur.close(); conn.close()
-
-    rows_u = "".join([f"<tr><td class='px-3 py-1'>{u['username']}</td><td>{'✅' if u['is_active'] else '❌'}</td><td>{'👁️' if u['can_see_similar'] else '🚫'}</td><td>{'🛡️' if u['is_admin'] else '-'}</td><td>{u['created_at']:%Y-%m-%d %H:%M}</td></tr>" for u in users])
-    rows_r = "".join([f"<tr><td class='px-3 py-1'>{r['id']}</td><td>{r['method']}</td><td>{r['lang']}</td><td>{r['created_at']:%Y-%m-%d %H:%M}</td></tr>" for r in reports])
-
-    def _fmt(d):
-        try:
-            return json.dumps(d, ensure_ascii=False)
-        except Exception:
-            return str(d)
-
-    rows_a = "".join([
-        f"<tr>"
-        f"<td class='px-3 py-1'>{a['created_at']:%Y-%m-%d %H:%M:%S}</td>"
-        f"<td>{a['username'] or '-'}</td>"
-        f"<td>{a['action']}</td>"
-        f"<td>{a['report_id'] or '-'}</td>"
-        f"<td>{a['ip'] or '-'}</td>"
-        f"<td><code style='font-size:12px'>{_fmt(a['extra'])}</code></td>"
-        f"</tr>"
-        for a in acts
-    ])
-
-    html = f"""
-    <html><body style="background:#0f172a;color:#e2e8f0;font-family:ui-sans-serif;padding:20px">
-      <h2 style="color:#fbbf24;margin-bottom:12px">Admin Panel</h2>
-
-      <h3 style="color:#22d3ee">Users</h3>
-      <table style="width:100%;border-collapse:collapse">
-        <thead><tr><th>Username</th><th>Active</th><th>Similar</th><th>Admin</th><th>Created</th></tr></thead>
-        <tbody>{rows_u}</tbody>
-      </table>
-
-      <h3 style="color:#22d3ee;margin-top:18px">Recent Reports</h3>
-      <table style="width:100%;border-collapse:collapse">
-        <thead><tr><th>ID</th><th>Method</th><th>Lang</th><th>Created</th></tr></thead>
-        <tbody>{rows_r}</tbody>
-      </table>
-
-      <h3 style="color:#22d3ee;margin-top:18px">Recent Activity (last 200)</h3>
-      <table style="width:100%;border-collapse:collapse">
-        <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Report</th><th>IP</th><th>Extra</th></tr></thead>
-        <tbody>{rows_a}</tbody>
-      </table>
-
-      <p style="margin-top:16px"><a href="{url_for('index')}" style="color:#93c5fd">← Back</a></p>
-    </body></html>
-    """
-    return html
+    fname, data = rec["filename"], rec["bytes"]
+    log_event("download_updated", title=fname)
+    return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=fname)
 
 # Short aliases
 @app.route("/d/<report_id>")
