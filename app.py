@@ -85,42 +85,83 @@ def top_keywords(text: str, k=10):
     return [w for w, _ in sorted(freq.items(), key=lambda x: -x[1])[:k]]
 
 def incident_summary_from_markdown(md: str) -> str:
-    m = re.search(r"(?im)^###\\s*Incident Summary\\s*\\n(.+?)(?:\\n###|\\Z)", md, re.S)
+    m = re.search(r"(?im)^###\s*Incident Summary\s*\n(.+?)(?:\n###|\Z)", md, re.S)
     if not m:
-        return "\\n".join(md.strip().splitlines()[:4])
+        return "\n".join(md.strip().splitlines()[:4])
     return m.group(1).strip()
+# ---- Human-like "Why similar" ----
+def _detect_phase(t: str):
+    t = t.lower()
+    if any(x in t for x in ["preflight", "pre-flight", "walkaround", "briefing", "dispatch", "paperwork", "documentation"]):
+        return "the pre-flight/dispatch stage"
+    if "taxi" in t:
+        return "the taxi phase"
+    if any(x in t for x in ["takeoff", "line up", "departure", "rotate"]):
+        return "the take-off phase"
+    if any(x in t for x in ["approach", "descent", "final"]):
+        return "the approach/landing phase"
+    if "landing" in t:
+        return "the landing phase"
+    return None
+
+def _detect_actor_set(t: str):
+    t = t.lower()
+    actors = []
+    for token, label in [
+        ("student", "a student pilot"),
+        ("dispatcher", "a dispatcher"),
+        ("instructor", "an instructor"),
+        ("cf i", "a CFI"),
+        ("cfi", "a CFI"),
+        ("maintenance", "maintenance staff"),
+        ("atc", "ATC"),
+        ("crew", "crew members"),
+    ]:
+        if token in t:
+            actors.append(label)
+    return set(actors)
+
+def _detect_factor(t: str):
+    t = t.lower()
+    checks = [
+        (["fuel", "refuel", "fueling"], "fuel management"),
+        (["checklist", "forgot", "missed checklist"], "a checklist lapse"),
+        (["radio", "avionics", "knob", "switch", "control"], "equipment familiarity (e.g., radio/controls)"),
+        (["record", "document", "paper", "mismatch", "discrepancy", "logbook"], "documentation discrepancy"),
+        (["weather", "wind", "visibility", "crosswind", "icing"], "weather constraints"),
+        (["runway", "taxiway", "clearance", "atc"], "airport/runway operations"),
+    ]
+    for keys, label in checks:
+        if any(k in t for k in keys):
+            return label
+    return "similar operational constraints"
 
 def build_why_similar(curr_text: str, past_text: str, overlap_terms, sim_score: float) -> str:
-    """
-    İnsan gibi, 2–3 cümlelik açıklama; riskli kör kopyalama için de uyarı içerir.
-    (LLM çağrısı yapmadan, heuristics ile üretir.)
-    """
-    def phase_hint(t: str):
-        t = (t or "").lower()
-        if any(w in t for w in ["pushback", "taxi", "ramp", "ground"]): return "ground/taxi"
-        if any(w in t for w in ["takeoff", "rotation", "v1", "v2", "liftoff"]): return "takeoff"
-        if "climb" in t: return "climb"
-        if "cruise" in t: return "cruise"
-        if any(w in t for w in ["descent", "approach", "final", "ils", "glideslope"]): return "approach/landing"
-        if any(w in t for w in ["landing", "touchdown", "rollout", "braking", "runway excursion"]): return "landing/rollout"
-        return None
+    phase_curr = _detect_phase(curr_text) or "a similar phase"
+    phase_past = _detect_phase(past_text) or "a similar phase"
+    factor = _detect_factor(curr_text + " " + past_text)
+    actors_curr = _detect_actor_set(curr_text)
+    actors_past = _detect_actor_set(past_text)
+    common_actor = None
+    inter = actors_curr & actors_past
+    if inter:
+        common_actor = list(inter)[0]
 
-    ph1, ph2 = phase_hint(curr_text), phase_hint(past_text)
-    common_phase = ph1 if ph1 and ph1 == ph2 else None
-    term_str = ", ".join(overlap_terms[:5]) if overlap_terms else ""
+    # human-like explanation
+    because_bits = []
+    because_bits.append(f"both unfold around {factor}")
+    if phase_curr and phase_past:
+        because_bits.append(f"and occur during {phase_curr} in one case and {phase_past} in the other")
+    if overlap_terms:
+        because_bits.append(f"with shared terms like {', '.join(overlap_terms[:6])}")
+    if common_actor:
+        because_bits.append(f"involving {common_actor} in each case")
 
-    bits = []
-    if common_phase:
-        bits.append(f"both occur during the {common_phase} phase")
-    if term_str:
-        bits.append(f"share recurring factors such as {term_str}")
-    if not bits:
-        bits.append("follow a comparable chain of contributing factors and outcomes")
+    because = ", ".join(because_bits)
+    warn = "Note: This is a heuristic match; specific context (aircraft, airport, crew, weather) can differ. Use it to inspire mitigations, not as one-to-one prescriptions."
+    return f"These two reports are similar because {because}. Similarity ≈ {sim_score:.2f}. {warn}"
 
-    reason = " and ".join(bits)
-    warning = ("Please verify contextual differences (aircraft type, airport layout, weather, crew configuration) "
-               "before reusing any mitigation one-to-one.")
-    return f"These two reports are similar because they {reason}. Approximate similarity is {sim_score:.2f}. {warning}"
+# ---------- Prompt ----------
 def build_prompt(text, method, out_lang, feedback=None, similar_cases=None):
     lang_map = {
         "English": "Write the full analysis in clear, professional English.",
@@ -174,7 +215,6 @@ def analyze_with_gpt(text, method="Five Whys", out_lang="English", feedback=None
         max_tokens=1200
     )
     return resp.choices[0].message.content.strip()
-
 # ---------- PDF ----------
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, HRFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -215,8 +255,8 @@ def _render_simple_markdown(elements, markdown_text, h2, body):
             elements.append(Paragraph(" ".join(para_buf).strip(), body))
             para_buf = []
 
-    bullet_re = re.compile(r"^\\s*[-•]\\s+")
-    numbered_re = re.compile(r"^\\s*\\d+\\.\\s+")
+    bullet_re = re.compile(r"^\s*[-•]\s+")
+    numbered_re = re.compile(r"^\s*\d+\.\s+")
     while i < len(lines):
         ln = lines[i]
         if not ln.strip():
@@ -253,7 +293,8 @@ def generate_pdf_report(markdown_text: str, title="Safety Report"):
     buf.seek(0)
     return buf
 
-def generate_pdf_full(current_markdown, similar_list, title="Safety Report (with similar)"):
+# >>> UPDATED: pretty "report + similar" PDF (same renderer & look as single report)
+def generate_pdf_full(current_markdown, similar_list, title="Safety Report (with Similar Cases)"):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
                             leftMargin=18*mm, rightMargin=18*mm,
@@ -262,21 +303,23 @@ def generate_pdf_full(current_markdown, similar_list, title="Safety Report (with
     els = [Paragraph(title, title_style),
            HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#0ea5e9"), spaceAfter=8)]
 
+    # Current report, rendered with markdown parser (pretty!)
     els.append(Paragraph("Current Report", h2))
-    els.append(Paragraph(current_markdown.replace("\\n", "<br/>"), body))
-    els.append(Spacer(1,10))
+    _render_simple_markdown(els, current_markdown, h2, body)
+    els.append(Spacer(1, 10))
 
+    # Similar cases
     if similar_list:
-        els.append(Paragraph("Similar Cases", h2))
+        els.append(Paragraph("Similar Cases (Top 5)", h2))
         for i, c in enumerate(similar_list, 1):
-            els.append(Paragraph(f"Case {i} — Similarity: {c['sim']:.2f}", body))
-            els.append(Paragraph(f"Why similar: {c['why']}", body))
-            els.append(Paragraph(f"Snippet:", body))
-            els.append(Paragraph(c["snippet"].replace("\\n", "<br/>"), body))
+            els.append(Paragraph(f"Case {i} — Similarity: {c['sim']:.2f}", h2))
+            els.append(Paragraph(f"<b>Why similar:</b> {c['why']}", body))
+            els.append(Paragraph("<b>Snippet:</b>", body))
+            els.append(Paragraph((c["snippet"] or "").replace("\n", "<br/>"), body))
             els.append(Spacer(1,6))
             if c.get("full_markdown"):
                 els.append(Paragraph("<b>Full Case Report</b>", body))
-                els.append(Paragraph(c["full_markdown"].replace("\\n", "<br/>"), body))
+                _render_simple_markdown(els, c["full_markdown"], h2, body)
                 els.append(Spacer(1,10))
 
     doc.build(els, onFirstPage=_header_footer, onLaterPages=_header_footer)
@@ -407,7 +450,6 @@ def _fetch_all_reports():
     rows = cur.fetchall()
     cur.close(); conn.close()
     return rows
-
 @app.route("/analyze", methods=["POST"])
 def analyze():
     if not session.get("logged_in"):
@@ -418,7 +460,6 @@ def analyze():
     lang     = request.form.get("lang","English")
     text     = extract_text_from_pdf(pdf_file)
 
-    # 1) Embedding & benzer adaylar
     q_emb = get_embedding(text)
     curr_terms = top_keywords(text)
     candidates = []
@@ -442,13 +483,9 @@ def analyze():
             except Exception:
                 pass
 
-    # 2) Gerçekten en benzer 5
     similar_cases = sorted(candidates, key=lambda x: -x["sim"])[:5]
-
-    # 3) Analizi AI ile yaz (benzerler dahil)
     result = analyze_with_gpt(text, method, lang, similar_cases=similar_cases)
 
-    # 4) DB'ye kaydet
     rid = str(uuid.uuid4())
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
@@ -456,7 +493,6 @@ def analyze():
                 (rid, method, lang, text, result, json.dumps(q_emb)))
     conn.commit(); cur.close(); conn.close()
 
-    # 5) UI bloğu
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     sim_target = f"sim-{rid}"
     can_see = session.get("can_see_similar", True)
@@ -500,9 +536,9 @@ def analyze():
     </div>
     """
     return block
+
 @app.route("/similar/<report_id>")
 def similar_cases(report_id):
-    # Mevcut raporu al
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT report_text, result_text, embedding FROM sreports WHERE id=%s;", (report_id,))
@@ -533,7 +569,7 @@ def similar_cases(report_id):
                 pass
 
     items.sort(key=lambda x: -x[0])
-    items = items[:5]  # UI'da da en iyi 5
+    items = items[:5]
 
     if not items:
         return "<div class='text-slate-300'>No close matches found.</div>"
@@ -592,16 +628,14 @@ def feedback():
     text    = request.form.get("text","")
     fb      = request.form.get("feedback","")
 
-    # 1) Güncellenmiş raporu yazdır
+    # 1) updated markdown
     updated = analyze_with_gpt(text, method, lang, feedback=fb)
 
-    # 2) Updated rapor için benzer ilk 5 vakayı hesapla (orijinal olay metnine göre)
+    # 2) build "updated + similar" PDF too (top-5)
     q_emb = get_embedding(text)
     curr_terms = top_keywords(text)
     sims = []
     for r in _fetch_all_reports():
-        if str(r["id"]) == str(rid):
-            continue
         if r["embedding"]:
             try:
                 vec = json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
@@ -614,7 +648,7 @@ def feedback():
                     sims.append({
                         "id": str(r["id"]),
                         "sim": sim,
-                        "snippet": (summ or past_txt[:220]).strip(),
+                        "snippet": summ or past_txt[:220],
                         "why": why,
                         "full_markdown": r["result_text"] or ""
                     })
@@ -623,27 +657,25 @@ def feedback():
     sims.sort(key=lambda x: -x["sim"])
     sims = sims[:5]
 
-    # 3) İki PDF’i hazırlayıp hafızaya koy
-    pdf_updated = generate_pdf_report(updated, title=f"Updated Safety Report — {method} — {lang}")
-    pdf_updated_full = generate_pdf_full(updated, sims, title="Updated Safety Report (with Similar Cases)")
-
-    file_id = uuid.uuid4().hex
-    _PDF_STORE[file_id] = (f"updated_report_{file_id}.pdf", pdf_updated.getvalue())
-
-    file_id_full = uuid.uuid4().hex
-    _PDF_STORE[file_id_full] = (f"updated_report_with_similar_{file_id_full}.pdf", pdf_updated_full.getvalue())
-
-    # 4) UI bloğu (iki indirme linki)
+    # 3) PDFs to memory store
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    pdf_buf_single = generate_pdf_report(updated, title=f"Updated Safety Report — {method} — {lang}")
+    file_id_single = uuid.uuid4().hex
+    _PDF_STORE[file_id_single] = (f"updated_report_{file_id_single}.pdf", pdf_buf_single.getvalue())
+
+    pdf_buf_full = generate_pdf_full(updated, sims, title="Updated Safety Report (with Similar Cases)")
+    file_id_full = uuid.uuid4().hex
+    _PDF_STORE[file_id_full] = (f"updated_report_with_similar_{file_id_full}.pdf", pdf_buf_full.getvalue())
+
     block = f"""
     <div class="bg-slate-700/70 p-4 rounded-2xl border border-white/10">
       <div class="flex justify-between mb-2">
         <h3 class="text-emerald-300 font-bold">🤖 Updated Report</h3>
         <span class="text-xs text-slate-400">{now}</span>
       </div>
-      <div class="mb-2 flex flex-wrap gap-2">
+      <div class="mb-2 space-x-2">
         <a class="px-3 py-2 rounded-lg bg-emerald-600/90 hover:bg-emerald-600 text-white text-sm"
-           href="{url_for('download_memory_pdf', file_id=file_id)}">⬇ Download PDF (updated)</a>
+           href="{url_for('download_memory_pdf', file_id=file_id_single)}">⬇ Download PDF (updated)</a>
         <a class="px-3 py-2 rounded-lg bg-sky-600/90 hover:bg-sky-600 text-white text-sm"
            href="{url_for('download_memory_pdf', file_id=file_id_full)}">⬇ Download PDF (updated + similar)</a>
       </div>
@@ -651,6 +683,7 @@ def feedback():
     </div>
     """
     return block
+
 # In-memory store for updated downloads
 _PDF_STORE = {}  # {file_id: (filename, bytes)}
 
@@ -669,7 +702,6 @@ def download_report(report_id):
 
 @app.route("/download/full/<report_id>")
 def download_full(report_id):
-    # report + similar cases
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT report_text, result_text, embedding FROM sreports WHERE id=%s;", (report_id,))
@@ -683,7 +715,6 @@ def download_full(report_id):
     q_emb = json.loads(row["embedding"]) if isinstance(row["embedding"], str) else row["embedding"]
     curr_terms = top_keywords(text)
 
-    # recompute top-5 with explanations
     sims = []
     for r in _fetch_all_reports():
         if str(r["id"]) == report_id:
@@ -706,10 +737,9 @@ def download_full(report_id):
                     })
             except Exception:
                 pass
-    sims.sort(key=lambda x: -x["sim"])   # ✅ hatalı satır kaldırıldı; doğru sıralama
-    sims = sims[:5]
+    sims.sort(key=lambda x: -x["sim"])
 
-    pdf = generate_pdf_full(current_md, sims, title="Safety Report (with Similar Cases)")
+    pdf = generate_pdf_full(current_md, sims[:5], title="Safety Report (with Similar Cases)")
     return send_file(pdf, as_attachment=True, download_name="report_with_similar.pdf")
 
 @app.route("/download/memory/<file_id>")
@@ -719,7 +749,6 @@ def download_memory_pdf(file_id):
     fname, data = _PDF_STORE[file_id]
     return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=fname)
 
-# Short aliases
 @app.route("/d/<report_id>")
 def d_short(report_id):
     return download_report(report_id)
