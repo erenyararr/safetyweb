@@ -142,22 +142,18 @@ def build_why_similar(curr_text: str, past_text: str, overlap_terms, sim_score: 
     factor = _detect_factor(curr_text + " " + past_text)
     actors_curr = _detect_actor_set(curr_text)
     actors_past = _detect_actor_set(past_text)
-    common_actor = None
     inter = actors_curr & actors_past
-    if inter:
-        common_actor = list(inter)[0]
+    common_actor = list(inter)[0] if inter else None
 
-    # human-like explanation
-    because_bits = []
-    because_bits.append(f"both unfold around {factor}")
+    because_bits = [f"both unfold around {factor}"]
     if phase_curr and phase_past:
         because_bits.append(f"and occur during {phase_curr} in one case and {phase_past} in the other")
     if overlap_terms:
         because_bits.append(f"with shared terms like {', '.join(overlap_terms[:6])}")
     if common_actor:
         because_bits.append(f"involving {common_actor} in each case")
-
     because = ", ".join(because_bits)
+
     warn = "Note: This is a heuristic match; specific context (aircraft, airport, crew, weather) can differ. Use it to inspire mitigations, not as one-to-one prescriptions."
     return f"These two reports are similar because {because}. Similarity ≈ {sim_score:.2f}. {warn}"
 
@@ -293,7 +289,7 @@ def generate_pdf_report(markdown_text: str, title="Safety Report"):
     buf.seek(0)
     return buf
 
-# >>> UPDATED: pretty "report + similar" PDF (same renderer & look as single report)
+# >>> pretty "report + similar"
 def generate_pdf_full(current_markdown, similar_list, title="Safety Report (with Similar Cases)"):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -303,12 +299,10 @@ def generate_pdf_full(current_markdown, similar_list, title="Safety Report (with
     els = [Paragraph(title, title_style),
            HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#0ea5e9"), spaceAfter=8)]
 
-    # Current report, rendered with markdown parser (pretty!)
     els.append(Paragraph("Current Report", h2))
     _render_simple_markdown(els, current_markdown, h2, body)
-    els.append(Spacer(1, 10))
+    els.append(Spacer(1,10))
 
-    # Similar cases
     if similar_list:
         els.append(Paragraph("Similar Cases (Top 5)", h2))
         for i, c in enumerate(similar_list, 1):
@@ -368,7 +362,6 @@ PAGE = """
     {% else %}
       <p class="text-slate-400 mb-10">Upload a PDF, we'll find similar cases, and draft an analysis. You can send feedback and re-generate.</p>
 
-      <!-- Upload form (English-only custom file input) -->
       <form hx-post="{{ url_for('analyze') }}" hx-target="#reports" hx-swap="beforeend" enctype="multipart/form-data"
             class="bg-white/10 p-8 rounded-3xl mb-12 space-y-6">
 
@@ -376,18 +369,11 @@ PAGE = """
           <label class="block text-lg font-semibold text-cyan-300 mb-2">Upload PDF</label>
 
           <div class="relative inline-flex items-center">
-            <!-- hidden real input -->
             <input id="pdfInput" name="pdf" type="file" accept=".pdf"
                    class="absolute inset-0 w-full h-full opacity-0 cursor-pointer" required
                    onchange="document.getElementById('fileName').textContent=this.files?.[0]?.name||'No file chosen'">
-
-            <!-- visible English button -->
             <button type="button" class="px-4 py-2 rounded-lg text-white"
-                    style="background:linear-gradient(90deg,#34d399,#22d3ee,#3b82f6);">
-              📄 Choose File
-            </button>
-
-            <!-- filename -->
+                    style="background:linear-gradient(90deg,#34d399,#22d3ee,#3b82f6);">📄 Choose File</button>
             <span id="fileName" class="ml-3 text-sm text-slate-300">No file chosen</span>
           </div>
         </div>
@@ -462,28 +448,31 @@ def analyze():
 
     q_emb = get_embedding(text)
     curr_terms = top_keywords(text)
-    candidates = []
-    for r in _fetch_all_reports():
-        if r["embedding"]:
-            try:
-                vec = json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
-                sim = cosine_similarity(q_emb, vec)
-                if sim >= 0.60:
-                    past_text = r["report_text"] or ""
-                    overlap = list(set(curr_terms) & set(top_keywords(past_text)))
-                    why = build_why_similar(text, past_text, overlap, sim)
-                    summ = incident_summary_from_markdown(r["result_text"] or r["report_text"] or "")
-                    candidates.append({
-                        "id": str(r["id"]),
-                        "sim": sim,
-                        "snippet": (summ or past_text[:220]).strip(),
-                        "why": why,
-                        "full_markdown": r["result_text"] or ""
-                    })
-            except Exception:
-                pass
 
-    similar_cases = sorted(candidates, key=lambda x: -x["sim"])[:5]
+    similar_cases = []
+    if session.get("can_see_similar", True):
+        candidates = []
+        for r in _fetch_all_reports():
+            if r["embedding"]:
+                try:
+                    vec = json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
+                    sim = cosine_similarity(q_emb, vec)
+                    if sim >= 0.60:
+                        past_text = r["report_text"] or ""
+                        overlap = list(set(curr_terms) & set(top_keywords(past_text)))
+                        why = build_why_similar(text, past_text, overlap, sim)
+                        summ = incident_summary_from_markdown(r["result_text"] or r["report_text"] or "")
+                        candidates.append({
+                            "id": str(r["id"]),
+                            "sim": sim,
+                            "snippet": (summ or past_text[:220]).strip(),
+                            "why": why,
+                            "full_markdown": r["result_text"] or ""
+                        })
+                except Exception:
+                    pass
+        similar_cases = sorted(candidates, key=lambda x: -x["sim"])[:5]
+
     result = analyze_with_gpt(text, method, lang, similar_cases=similar_cases)
 
     rid = str(uuid.uuid4())
@@ -497,11 +486,16 @@ def analyze():
     sim_target = f"sim-{rid}"
     can_see = session.get("can_see_similar", True)
     sim_btn = ""
+    dl_full_btn = ""
     if can_see:
         sim_btn = f"""
         <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
                 hx-get="{url_for('similar_cases', report_id=rid)}"
                 hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Show Similar Cases</button>
+        """
+        dl_full_btn = f"""
+        <a class="px-3 py-2 rounded-lg bg-sky-600/90 hover:bg-sky-600 text-white text-sm"
+           href="{url_for('download_full', report_id=rid)}">⬇ Download PDF (report + similar)</a>
         """
 
     block = f"""
@@ -514,8 +508,7 @@ def analyze():
       <div class="flex flex-wrap gap-3 mb-3">
         <a class="px-3 py-2 rounded-lg bg-emerald-600/90 hover:bg-emerald-600 text-white text-sm"
            href="{url_for('download_report', report_id=rid)}">⬇ Download PDF (report)</a>
-        <a class="px-3 py-2 rounded-lg bg-sky-600/90 hover:bg-sky-600 text-white text-sm"
-           href="{url_for('download_full', report_id=rid)}">⬇ Download PDF (report + similar)</a>
+        {dl_full_btn}
         {sim_btn}
       </div>
 
@@ -539,6 +532,11 @@ def analyze():
 
 @app.route("/similar/<report_id>")
 def similar_cases(report_id):
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
+    if not session.get("can_see_similar", True):
+        return "<div class='text-rose-400'>You don't have access to similar cases.</div>", 403
+
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT report_text, result_text, embedding FROM sreports WHERE id=%s;", (report_id,))
@@ -597,6 +595,11 @@ def similar_cases(report_id):
 
 @app.route("/case/preview/<case_id>")
 def case_preview(case_id):
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
+    if not session.get("can_see_similar", True):
+        return "<div class='text-rose-400'>You don't have access to similar cases.</div>", 403
+
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT result_text FROM sreports WHERE id=%s;", (case_id,))
@@ -608,6 +611,11 @@ def case_preview(case_id):
 
 @app.route("/case/<case_id>")
 def case_fullpage(case_id):
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
+    if not session.get("can_see_similar", True):
+        return "Forbidden", 403
+
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT result_text FROM sreports WHERE id=%s;", (case_id,))
@@ -628,44 +636,50 @@ def feedback():
     text    = request.form.get("text","")
     fb      = request.form.get("feedback","")
 
-    # 1) updated markdown
     updated = analyze_with_gpt(text, method, lang, feedback=fb)
 
-    # 2) build "updated + similar" PDF too (top-5)
-    q_emb = get_embedding(text)
-    curr_terms = top_keywords(text)
-    sims = []
-    for r in _fetch_all_reports():
-        if r["embedding"]:
-            try:
-                vec = json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
-                sim = cosine_similarity(q_emb, vec)
-                if sim >= 0.60:
-                    past_txt = r["report_text"] or ""
-                    overlap = list(set(curr_terms) & set(top_keywords(past_txt)))
-                    why = build_why_similar(text, past_txt, overlap, sim)
-                    summ = incident_summary_from_markdown(r["result_text"] or r["report_text"] or "")
-                    sims.append({
-                        "id": str(r["id"]),
-                        "sim": sim,
-                        "snippet": summ or past_txt[:220],
-                        "why": why,
-                        "full_markdown": r["result_text"] or ""
-                    })
-            except Exception:
-                pass
-    sims.sort(key=lambda x: -x["sim"])
-    sims = sims[:5]
-
-    # 3) PDFs to memory store
+    # her zaman "updated" tek PDF
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     pdf_buf_single = generate_pdf_report(updated, title=f"Updated Safety Report — {method} — {lang}")
     file_id_single = uuid.uuid4().hex
     _PDF_STORE[file_id_single] = (f"updated_report_{file_id_single}.pdf", pdf_buf_single.getvalue())
 
-    pdf_buf_full = generate_pdf_full(updated, sims, title="Updated Safety Report (with Similar Cases)")
-    file_id_full = uuid.uuid4().hex
-    _PDF_STORE[file_id_full] = (f"updated_report_with_similar_{file_id_full}.pdf", pdf_buf_full.getvalue())
+    # sadece yetkili ise "updated + similar" üret
+    links_extra = ""
+    if session.get("can_see_similar", True):
+        q_emb = get_embedding(text)
+        curr_terms = top_keywords(text)
+        sims = []
+        for r in _fetch_all_reports():
+            if r["embedding"]:
+                try:
+                    vec = json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
+                    sim = cosine_similarity(q_emb, vec)
+                    if sim >= 0.60:
+                        past_txt = r["report_text"] or ""
+                        overlap = list(set(curr_terms) & set(top_keywords(past_txt)))
+                        why = build_why_similar(text, past_txt, overlap, sim)
+                        summ = incident_summary_from_markdown(r["result_text"] or r["report_text"] or "")
+                        sims.append({
+                            "id": str(r["id"]),
+                            "sim": sim,
+                            "snippet": summ or past_txt[:220],
+                            "why": why,
+                            "full_markdown": r["result_text"] or ""
+                        })
+                except Exception:
+                    pass
+        sims.sort(key=lambda x: -x["sim"])
+        sims = sims[:5]
+
+        pdf_buf_full = generate_pdf_full(updated, sims, title="Updated Safety Report (with Similar Cases)")
+        file_id_full = uuid.uuid4().hex
+        # meta ile işaretle: similar izni gerekir
+        _PDF_STORE[file_id_full] = (f"updated_report_with_similar_{file_id_full}.pdf", pdf_buf_full.getvalue(), {"requires_similar_perm": True})
+        links_extra = f"""
+        <a class="px-3 py-2 rounded-lg bg-sky-600/90 hover:bg-sky-600 text-white text-sm"
+           href="{url_for('download_memory_pdf', file_id=file_id_full)}">⬇ Download PDF (updated + similar)</a>
+        """
 
     block = f"""
     <div class="bg-slate-700/70 p-4 rounded-2xl border border-white/10">
@@ -676,8 +690,7 @@ def feedback():
       <div class="mb-2 space-x-2">
         <a class="px-3 py-2 rounded-lg bg-emerald-600/90 hover:bg-emerald-600 text-white text-sm"
            href="{url_for('download_memory_pdf', file_id=file_id_single)}">⬇ Download PDF (updated)</a>
-        <a class="px-3 py-2 rounded-lg bg-sky-600/90 hover:bg-sky-600 text-white text-sm"
-           href="{url_for('download_memory_pdf', file_id=file_id_full)}">⬇ Download PDF (updated + similar)</a>
+        {links_extra}
       </div>
       <pre class="whitespace-pre-wrap text-sm bg-slate-900/60 p-3 rounded border border-slate-700">{updated}</pre>
     </div>
@@ -685,10 +698,12 @@ def feedback():
     return block
 
 # In-memory store for updated downloads
-_PDF_STORE = {}  # {file_id: (filename, bytes)}
+_PDF_STORE = {}  # {file_id: (filename, bytes)} or (filename, bytes, meta)
 
 @app.route("/download/report/<report_id>")
 def download_report(report_id):
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT result_text, method, lang FROM sreports WHERE id=%s;", (report_id,))
@@ -702,6 +717,11 @@ def download_report(report_id):
 
 @app.route("/download/full/<report_id>")
 def download_full(report_id):
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
+    if not session.get("can_see_similar", True):
+        return "Forbidden", 403
+
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT report_text, result_text, embedding FROM sreports WHERE id=%s;", (report_id,))
@@ -746,7 +766,16 @@ def download_full(report_id):
 def download_memory_pdf(file_id):
     if file_id not in _PDF_STORE:
         return "Not found", 404
-    fname, data = _PDF_STORE[file_id]
+    val = _PDF_STORE[file_id]
+    # backward-compatible unpack
+    if isinstance(val, tuple) and len(val) == 3:
+        fname, data, meta = val
+    else:
+        fname, data = val
+        meta = {}
+    # permission check for "updated + similar"
+    if meta.get("requires_similar_perm") and not session.get("can_see_similar", True):
+        return "Forbidden", 403
     return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=fname)
 
 @app.route("/d/<report_id>")
