@@ -641,7 +641,7 @@ def analyze():
             except Exception:
                 pass
 
-    similar_cases = sorted(candidates, key=lambda x: -x["sim"])[:5]
+    similar_cases = sorted(candidates, key=lambda x: -x["sim"])[:10]
     result = analyze_with_gpt(text, method, lang, similar_cases=similar_cases)
 
     rid = str(uuid.uuid4())
@@ -753,7 +753,7 @@ def similar_cases(report_id):
                 pass
 
     items.sort(key=lambda x: -x[0])
-    items = items[:5]
+    items = items[:10]
 
     if not items:
         return f"<div class='text-slate-300'>No close matches found for scope: {scope}.</div>"
@@ -853,7 +853,7 @@ def feedback():
             except Exception:
                 pass
     sims.sort(key=lambda x: -x["sim"])
-    sims = sims[:5]
+    sims = sims[:10]
 
     # PDF'leri hazırla (in-memory store)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -955,7 +955,7 @@ def download_full(report_id):
             except Exception:
                 pass
     sims.sort(key=lambda x: -x["sim"])
-    sims = sims[:5]
+    sims = sims[:10]
 
     title = f"Safety Report — {row['method']} — {row['lang']}"
     log_event("download_full", report_id=report_id, title=title, extra={"similar_count": len(sims)})
