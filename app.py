@@ -40,7 +40,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS susers (
         id UUID PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,          -- düz metin (kolay kurulum için)
+        password TEXT NOT NULL,
         can_see_similar BOOLEAN DEFAULT TRUE,
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT NOW()
@@ -54,7 +54,7 @@ def init_db():
         id UUID PRIMARY KEY,
         user_id UUID,
         username TEXT,
-        action TEXT NOT NULL,            -- login, logout, analyze, download_report, download_full, updated_report, download_updated
+        action TEXT NOT NULL,
         report_id UUID,
         title TEXT,
         ip TEXT,
@@ -110,7 +110,7 @@ def incident_summary_from_markdown(md: str) -> str:
     return m.group(1).strip()
 
 def build_why_similar(curr_text: str, past_text: str, overlap_terms, sim_score: float) -> str:
-    """İnsan gibi açıklama + uyarı."""
+    """İnsan gibi kısa açıklama."""
     if overlap_terms:
         because = f"they both center on {', '.join(overlap_terms[:3])} and show a comparable pattern of contributing factors"
     else:
@@ -120,6 +120,29 @@ def build_why_similar(curr_text: str, past_text: str, overlap_terms, sim_score: 
     return (f"These two reports are similar because {because}. "
             f"Approximate similarity score: {sim_score:.2f}. {warn}")
 
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or ""
+
+def log_event(action, report_id=None, title=None, extra=None, username=None):
+    try:
+        uid = session.get("user_id")
+        uname = username or session.get("username")
+        ua = (request.headers.get("User-Agent") or "")[:300]
+        ip = _client_ip()
+        conn = psycopg2.connect(DB_URL, sslmode="require")
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO activity_log (id, user_id, username, action, report_id, title, ip, user_agent, extra) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+            (str(uuid.uuid4()), uid, uname, action, report_id, title, ip, ua, json.dumps(extra or {}))
+        )
+        conn.commit()
+        cur.close(); conn.close()
+    except Exception:
+        pass
 def build_prompt(text, method, out_lang, feedback=None, similar_cases=None):
     lang_map = {
         "English": "Write the full analysis in clear, professional English.",
@@ -281,9 +304,9 @@ def generate_pdf_full(current_markdown, similar_list, title="Safety Report (with
     doc.build(els, onFirstPage=_header_footer, onLaterPages=_header_footer)
     buf.seek(0)
     return buf
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret")
-
 PAGE = """
 <!doctype html>
 <html lang="en">
@@ -475,34 +498,48 @@ ADMIN_PAGE = """
 def _fetch_all_reports():
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT id, report_text, result_text, embedding FROM sreports ORDER BY created_at DESC LIMIT 1000;")
+    # method'i da alalım ki scope filtreleyelim
+    cur.execute("SELECT id, method, report_text, result_text, embedding FROM sreports ORDER BY created_at DESC LIMIT 1000;")
     rows = cur.fetchall()
     cur.close(); conn.close()
     return rows
 
-def _client_ip():
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.remote_addr or ""
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string(PAGE)
 
-def log_event(action, report_id=None, title=None, extra=None, username=None):
-    try:
-        uid = session.get("user_id")
-        uname = username or session.get("username")
-        ua = (request.headers.get("User-Agent") or "")[:300]
-        ip = _client_ip()
-        conn = psycopg2.connect(DB_URL, sslmode="require")
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO activity_log (id, user_id, username, action, report_id, title, ip, user_agent, extra) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);",
-            (str(uuid.uuid4()), uid, uname, action, report_id, title, ip, ua, json.dumps(extra or {}))
-        )
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception:
-        pass
+@app.route("/login", methods=["POST"])
+def login():
+    username = request.form.get("username","").strip()
+    password = request.form.get("password","").strip()
+
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT id, password, can_see_similar, is_active, is_admin FROM susers WHERE username=%s;", (username,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+
+    ok = bool(row and row["is_active"] and row["password"] == password)
+    if ok:
+        session["logged_in"] = True
+        session["user_id"] = str(row["id"])
+        session["username"] = username
+        session["can_see_similar"] = bool(row["can_see_similar"])
+        session["is_admin"] = bool(row["is_admin"])
+        log_event("login", extra={"success": True})
+    else:
+        log_event("login", extra={"success": False}, username=username)
+    return redirect(url_for("index"))
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    log_event("logout")
+    session.pop("logged_in", None)
+    session.pop("user_id", None)
+    session.pop("username", None)
+    session.pop("can_see_similar", None)
+    session.pop("is_admin", None)
+    return redirect(url_for("index"))
 
 @app.route("/admin")
 def admin():
@@ -570,43 +607,6 @@ def admin():
         kpi_downloads_24h=kpi_downloads_24h,
         q_user=q_user
     )
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(PAGE)
-
-@app.route("/login", methods=["POST"])
-def login():
-    username = request.form.get("username","").strip()
-    password = request.form.get("password","").strip()
-
-    conn = psycopg2.connect(DB_URL, sslmode="require")
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT id, password, can_see_similar, is_active, is_admin FROM susers WHERE username=%s;", (username,))
-    row = cur.fetchone()
-    cur.close(); conn.close()
-
-    ok = bool(row and row["is_active"] and row["password"] == password)
-    if ok:
-        session["logged_in"] = True
-        session["user_id"] = str(row["id"])
-        session["username"] = username
-        session["can_see_similar"] = bool(row["can_see_similar"])
-        session["is_admin"] = bool(row["is_admin"])
-        log_event("login", extra={"success": True})
-    else:
-        log_event("login", extra={"success": False}, username=username)
-    return redirect(url_for("index"))
-
-@app.route("/logout", methods=["POST"])
-def logout():
-    log_event("logout")
-    session.pop("logged_in", None)
-    session.pop("user_id", None)
-    session.pop("username", None)
-    session.pop("can_see_similar", None)
-    session.pop("is_admin", None)
-    return redirect(url_for("index"))
-
 @app.route("/analyze", methods=["POST"])
 def analyze():
     if not session.get("logged_in"):
@@ -617,6 +617,7 @@ def analyze():
     lang     = request.form.get("lang","English")
     text     = extract_text_from_pdf(pdf_file)
 
+    # Benzer adaylar (varsayılan: tüm corpus; UI'da scope butonları ayrı)
     q_emb = get_embedding(text)
     curr_terms = top_keywords(text)
     candidates = []
@@ -656,12 +657,22 @@ def analyze():
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     sim_target = f"sim-{rid}"
     can_see = session.get("can_see_similar", True)
-    sim_btn = ""
+
+    # 3 ayrı scope butonu
+    sim_btns = ""
     if can_see:
-        sim_btn = f"""
-        <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
-                hx-get="{url_for('similar_cases', report_id=rid)}"
-                hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Show Similar Cases</button>
+        sim_btns = f"""
+        <div class="flex flex-wrap gap-2">
+          <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
+                  hx-get="{url_for('similar_cases', report_id=rid)}?scope=internal"
+                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Kurum içi</button>
+          <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
+                  hx-get="{url_for('similar_cases', report_id=rid)}?scope=all"
+                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Kurum içi + CADORS</button>
+          <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
+                  hx-get="{url_for('similar_cases', report_id=rid)}?scope=cadors"
+                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Sadece CADORS</button>
+        </div>
         """
 
     block = f"""
@@ -676,10 +687,11 @@ def analyze():
            href="{url_for('download_report', report_id=rid)}">⬇ Download PDF (report)</a>
         <a class="px-3 py-2 rounded-lg bg-sky-600/90 hover:bg-sky-600 text-white text-sm"
            href="{url_for('download_full', report_id=rid)}">⬇ Download PDF (report + similar)</a>
-        {sim_btn}
       </div>
 
-      <pre class="whitespace-pre-wrap text-sm bg-slate-900/60 p-3 rounded border border-slate-700">{result}</pre>
+      {sim_btns}
+
+      <pre class="whitespace-pre-wrap text-sm bg-slate-900/60 p-3 rounded border border-slate-700 mt-3">{result}</pre>
 
       <div id="{sim_target}" class="mt-4"></div>
 
@@ -699,6 +711,11 @@ def analyze():
 
 @app.route("/similar/<report_id>")
 def similar_cases(report_id):
+    # scope: internal / all / cadors
+    scope = (request.args.get("scope") or "all").lower()
+    if scope not in {"internal", "all", "cadors"}:
+        scope = "all"
+
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute("SELECT report_text, result_text, embedding FROM sreports WHERE id=%s;", (report_id,))
@@ -715,6 +732,13 @@ def similar_cases(report_id):
     for r in _fetch_all_reports():
         if str(r["id"]) == report_id:
             continue
+        # scope filtresi
+        is_cadors = (str(r.get("method") or "") == "Imported (CADORS)")
+        if scope == "internal" and is_cadors:
+            continue
+        if scope == "cadors" and not is_cadors:
+            continue
+
         if r["embedding"]:
             try:
                 vec = json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
@@ -732,10 +756,16 @@ def similar_cases(report_id):
     items = items[:5]
 
     if not items:
-        return "<div class='text-slate-300'>No close matches found.</div>"
+        return f"<div class='text-slate-300'>No close matches found for scope: {scope}.</div>"
 
-    html = ["<div class='bg-slate-900/40 p-3 rounded-lg border border-white/10'>",
-            "<div class='font-semibold text-cyan-300 mb-2'>Similar Cases (Top 5)</div>"]
+    scope_label = {
+        "internal": "Kurum içi",
+        "all": "Kurum içi + CADORS",
+        "cadors": "Sadece CADORS"
+    }[scope]
+
+    html = [f"<div class='bg-slate-900/40 p-3 rounded-lg border border-white/10'>",
+            f"<div class='font-semibold text-cyan-300 mb-2'>Similar Cases (Top 5) — <span class='text-slate-200'>{scope_label}</span></div>"]
     for sim, cid, summ, why in items:
         html.append(f"""
         <div class="mb-3 p-3 rounded-lg bg-slate-800/50 border border-slate-700">
@@ -753,28 +783,37 @@ def similar_cases(report_id):
         """)
     html.append("</div>")
     return "\n".join(html)
+
 @app.route("/case/preview/<case_id>")
 def case_preview(case_id):
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT result_text FROM sreports WHERE id=%s;", (case_id,))
+    cur.execute("SELECT report_text, result_text FROM sreports WHERE id=%s;", (case_id,))
     row = cur.fetchone()
     cur.close(); conn.close()
     if not row:
         return "<div class='text-rose-400'>Not found.</div>"
-    return f"<pre class='whitespace-pre-wrap text-sm bg-slate-900/60 p-3 rounded border border-slate-700'>{row['result_text']}</pre>"
+
+    # CADORS için fallback özet
+    content = row["result_text"] or ""
+    if not content:
+        content = "### Incident Summary\n" + (incident_summary_from_markdown(row["report_text"] or "") or "")
+    return f"<pre class='whitespace-pre-wrap text-sm bg-slate-900/60 p-3 rounded border border-slate-700'>{content}</pre>"
 
 @app.route("/case/<case_id>")
 def case_fullpage(case_id):
     conn = psycopg2.connect(DB_URL, sslmode="require")
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT result_text FROM sreports WHERE id=%s;", (case_id,))
+    cur.execute("SELECT report_text, result_text FROM sreports WHERE id=%s;", (case_id,))
     row = cur.fetchone()
     cur.close(); conn.close()
     if not row:
         return "Not found", 404
-    return f"<html><body style='background:#0f172a;color:#e2e8f0;font-family:ui-sans-serif;padding:20px'><h2>Case {case_id}</h2><pre style='white-space:pre-wrap;background:#0b1220;padding:12px;border-radius:8px'>{row['result_text']}</pre></body></html>"
 
+    content = row["result_text"] or ""
+    if not content:
+        content = "### Incident Summary\n" + (incident_summary_from_markdown(row["report_text"] or "") or "")
+    return f"<html><body style='background:#0f172a;color:#e2e8f0;font-family:ui-sans-serif;padding:20px'><h2>Case {case_id}</h2><pre style='white-space:pre-wrap;background:#0b1220;padding:12px;border-radius:8px'>{content}</pre></body></html>"
 @app.route("/feedback", methods=["POST"])
 def feedback():
     if not session.get("logged_in"):
