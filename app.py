@@ -665,13 +665,13 @@ def analyze():
         <div class="flex flex-wrap gap-2">
           <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
                   hx-get="{url_for('similar_cases', report_id=rid)}?scope=internal"
-                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Kurum içi</button>
+                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Local DB</button>
           <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
                   hx-get="{url_for('similar_cases', report_id=rid)}?scope=all"
-                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Kurum içi + CADORS</button>
+                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Local DB + CADORS</button>
           <button class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
                   hx-get="{url_for('similar_cases', report_id=rid)}?scope=cadors"
-                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — Sadece CADORS</button>
+                  hx-target="#{sim_target}" hx-swap="innerHTML">🔎 Find Similar — only CADORS</button>
         </div>
         """
 
