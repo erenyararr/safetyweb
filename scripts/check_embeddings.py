@@ -1,38 +1,24 @@
 # scripts/check_embeddings.py
-# CADORS (method='Imported (CADORS)') kayıtları için embedding özet/backfill aracıdır.
+# CADORS kayıtları için eksik embedding'leri doldurur (backfill) veya özet verir.
 # Kullanım:
 #   python scripts/check_embeddings.py --summary
 #   python scripts/check_embeddings.py --backfill --batch-size 200 --limit 1000
-#   python scripts/check_embeddings.py --backfill --model text-embedding-3-large
 #
-# Env: DATABASE_URL, OPENAI_API_KEY
-# Opsiyonel: OPENAI_EMBED_MODEL
+# Gerekli env:
+#   DATABASE_URL, OPENAI_API_KEY
 
 import os, sys, time, argparse
 import psycopg2
 import psycopg2.extras as extras
 
-# --- OpenAI SDK: hem v1 (OpenAI client) hem v0 (openai.Embedding) ile uyum ---
-CLIENT_MODE = None  # 'v1' veya 'v0'
-OpenAI = None
-openai = None
-
+# openai==0.28.1 ile uyumlu kullanım
 try:
-    from openai import OpenAI  # v1+
-    CLIENT_MODE = 'v1'
+    import openai
 except Exception:
-    try:
-        import openai  # v0.x
-        CLIENT_MODE = 'v0'
-    except Exception:
-        CLIENT_MODE = None
-
-EMBED_DIM = 1536
-DEFAULT_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-MAX_INPUT_CHARS = 8000
+    openai = None
 
 def to_pgvector(vec):
-    return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 def get_conn():
     db_url = os.getenv("DATABASE_URL")
@@ -40,121 +26,118 @@ def get_conn():
         print("ERROR: DATABASE_URL yok.", file=sys.stderr); sys.exit(1)
     return psycopg2.connect(db_url)
 
-def safe_text(title, body):
-    t = (title or "").strip()
-    b = (body or "").strip()
-    text = (t + "\n" + b).strip()
-    if len(text) > MAX_INPUT_CHARS:
-        text = text[:MAX_INPUT_CHARS]
-    return text or "(empty)"
-
-def mk_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("ERROR: OPENAI_API_KEY yok.", file=sys.stderr); sys.exit(1)
-    if CLIENT_MODE == 'v1':
-        return OpenAI(api_key=api_key)
-    elif CLIENT_MODE == 'v0':
-        openai.api_key = api_key
-        return None
-    else:
-        print("ERROR: openai paketi kurulu değil. requirements.txt içine 'openai>=1.40.0' ekleyin.", file=sys.stderr)
-        sys.exit(1)
-
-def embed_text(client, model, text, retries=3, backoff=1.6):
-    last = None
-    for i in range(retries):
-        try:
-            if CLIENT_MODE == 'v1':
-                resp = client.embeddings.create(model=model, input=text)
-                return resp.data[0].embedding
-            else:  # v0
-                resp = openai.Embedding.create(model=model, input=text)
-                return resp["data"][0]["embedding"]
-        except Exception as e:
-            last = e
-            sleep = backoff ** i
-            print(f"[WARN] embed hata try {i+1}/{retries}: {e} → {sleep:.1f}s", file=sys.stderr)
-            time.sleep(sleep)
-    raise last
-
-SUMMARY_SQL = """
-with scope as (
-  select id, embedding
-  from sreports
-  where method = 'Imported (CADORS)'
-)
-select
-  (select count(*) from scope)                             as total,
-  (select count(*) from scope where embedding is not null) as with_emb,
-  (select count(*) from scope where embedding is null)     as missing;
-"""
-
-FETCH_BATCH_SQL = """
-select id, title, report_text
-from sreports
-where method = 'Imported (CADORS)' and embedding is null
-order by created_at desc
-limit %s;
-"""
-
-UPDATE_SQL = "update sreports set embedding = %s where id = %s"
+def column_exists(conn, table, col):
+    with conn.cursor() as c:
+        c.execute("""
+            select exists (
+              select 1 from information_schema.columns
+              where table_name=%s and column_name=%s
+            )
+        """, (table, col))
+        return bool(c.fetchone()[0])
 
 def summary():
+    sql = """
+    with scope as (
+      select id, embedding from sreports
+      where method = 'Imported (CADORS)'
+    )
+    select
+      (select count(*) from scope) as total,
+      (select count(*) from scope where embedding is not null) as with_emb,
+      (select count(*) from scope where embedding is null) as missing
+    ;
+    """
     with get_conn() as conn, conn.cursor(cursor_factory=extras.DictCursor) as cur:
-        cur.execute(SUMMARY_SQL)
+        cur.execute(sql)
         r = cur.fetchone()
     print("\n--- CADORS Embedding Summary ---")
     print(f"Total CADORS rows            : {r['total']}")
     print(f"With embedding (NOT NULL)    : {r['with_emb']}")
     print(f"Missing embedding (NULL)     : {r['missing']}\n")
 
-def backfill(batch_size=200, limit=None, model=DEFAULT_MODEL):
-    client = mk_client()
-    total_done = 0
+def backfill(batch_size=200, limit=None, model="text-embedding-3-small"):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("ERROR: OPENAI_API_KEY yok.", file=sys.stderr); sys.exit(1)
+    if openai is None:
+        print("ERROR: openai paketi kurulu değil (requirements.txt).", file=sys.stderr); sys.exit(1)
+    openai.api_key = api_key
+
+    fetched = 0
+    total_embedded = 0
     t0 = time.time()
+
     while True:
         with get_conn() as conn:
             conn.autocommit = False
+
+            # title var mı diye kontrol et
+            has_title = column_exists(conn, "sreports", "title")
+
+            select_sql = """
+                select id, {text_expr} as text
+                from sreports
+                where method = 'Imported (CADORS)' and embedding is null
+                order by created_at desc
+                limit %s
+            """.format(
+                text_expr=(
+                    "coalesce(title,'') || E'\\n' || coalesce(report_text,'')"
+                    if has_title else
+                    "coalesce(report_text,'')"
+                )
+            )
+
             with conn.cursor() as cur:
-                cur.execute(FETCH_BATCH_SQL, (batch_size,))
+                cur.execute(select_sql, (batch_size,))
                 rows = cur.fetchall()
+
                 if not rows:
                     break
-                for rid, title, body in rows:
-                    txt = safe_text(title, body)
-                    try:
-                        emb = embed_text(client, model, txt)
-                    except Exception as e:
-                        print(f"[ERROR] embedding yapılamadı id={rid}: {e}", file=sys.stderr)
-                        continue
-                    if len(emb) != EMBED_DIM:
-                        print(f"[WARN] dim={len(emb)} beklenen={EMBED_DIM} (id={rid})", file=sys.stderr)
-                    cur.execute(UPDATE_SQL, (to_pgvector(emb), rid))
-                    total_done += 1
-                    if limit is not None and total_done >= limit:
-                        break
+
+                for (rid, text) in rows:
+                    fetched += 1
+                    text = (text or "").strip()
+                    # Çok aşırı uzun metinlerde gereksiz masrafı kesmek için kırp (yaklaşık 15k karakter)
+                    if len(text) > 15000:
+                        text = text[:15000]
+
+                    if not text:
+                        emb = [0.0] * 1536
+                    else:
+                        resp = openai.Embedding.create(model=model, input=[text])
+                        emb = resp["data"][0]["embedding"]
+
+                    emb_str = to_pgvector(emb)
+                    cur.execute("update sreports set embedding = %s where id = %s", (emb_str, rid))
+                    total_embedded += 1
+
             conn.commit()
-        print(f"[{time.strftime('%H:%M:%S')}] batch ok. total_embedded={total_done}")
-        if limit is not None and total_done >= limit:
+
+        print(f"[{time.strftime('%H:%M:%S')}] batch ok: {len(rows)} | total_embedded: {total_embedded}")
+        if limit is not None and total_embedded >= limit:
             break
+
     dt = time.time() - t0
-    print(f"\nDONE. embedded={total_done} in {dt:.1f}s (model={model})\n")
+    print(f"\nDONE. embedded={total_embedded} in {dt:.1f}s\n")
     summary()
 
 def main():
-    p = argparse.ArgumentParser(description="CADORS embedding özet/backfill")
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--summary", action="store_true")
-    g.add_argument("--backfill", action="store_true")
-    p.add_argument("--batch-size", type=int, default=200)
-    p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    args = p.parse_args()
-    if args.summary or (not args.backfill):
-        summary()
-    else:
-        backfill(batch_size=args.batch_size, limit=args.limit, model=args.model)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--summary", action="store_true", help="Sadece özet ver")
+    parser.add_argument("--backfill", action="store_true", help="Eksik embedding'leri doldur")
+    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--limit", type=int, default=None, help="Bu kadar kaydı işle ve çık (opsiyonel)")
+    parser.add_argument("--model", type=str, default="text-embedding-3-small")
+    args = parser.parse_args()
+
+    if args.summary:
+        summary(); return
+    if args.backfill:
+        backfill(batch_size=args.batch_size, limit=args.limit, model=args.model); return
+
+    summary()
 
 if __name__ == "__main__":
     main()
