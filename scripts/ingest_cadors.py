@@ -1,214 +1,238 @@
 # scripts/ingest_cadors.py
-"""
-CADORS CSV'yi (son 24 ay vb.) okuyup 'sreports' tablosuna aktarır ve
-CADORS numarasını 'cadors_index' tablosunda sreports.id ile ilişkilendirir.
+# CADORS (Canada) kayıtlarını CSV'den alıp mevcut "sreports" tablosuna ekler.
+# "Imported (CADORS)" olarak ayarlar. app.py'ye dokunmadan çalışır.
+#
+# Kullanım (Railway veya lokal):
+#   python scripts/ingest_cadors.py --csv data/cadors_last24m.csv --embed --max-rows 100000 --reembed --reembed-max 25000
+#
+# Notlar:
+# - Aynı CADORS numarasını ikinci kez eklememek için "cadors_index" tablosu kullanılır.
+# - sreports.method = 'Imported (CADORS)' olarak eklenir; böylece app.py içinde
+#   "internal" ve "CADORS" ayrımı kolay yapılır.
+# - Embedding için önce env'deki OPENAI_API_KEY'i kullanır; yoksa "config.py" dosyası varsa oradan alır.
+# - --embed verilmezse embedding atlanır. --reembed ile var olan CADORS kayıtlarının boş embeddingleri sonradan doldurulur.
 
-Kullanım (Railway'de ya da lokal):
-    python scripts/ingest_cadors.py --csv data/cadors_last24m.csv           # sadece insert (embedding yok)
-    python scripts/ingest_cadors.py --csv data/cadors_last24m.csv --embed   # insert + OpenAI embedding
-    python scripts/ingest_cadors.py --csv data/cadors_last24m.csv --embed --max-rows 1000
+import os, sys, csv, json, uuid, argparse, datetime as dt
+import psycopg2, psycopg2.extras
 
-Gereken ENV:
-    DATABASE_URL       -> PostgreSQL bağlantısı
-    OPENAI_API_KEY     -> (sadece --embed verirsen) OpenAI 0.28.x için API key
+# --- OpenAI (eski 0.28 sürümü ile uyumlu) ---
+try:
+    import openai
+except Exception as e:
+    openai = None
 
-Notlar:
-- 'sreports.method' = 'Imported (CADORS)' olarak eklenir (UI'da ayırt etmesi kolay).
-- Aynı CADORS numarası birden fazla kez eklenmesin diye 'cadors_index' tablosu kullanılır.
-"""
+# API key: env > config.py
+API_KEY = os.getenv("OPENAI_API_KEY")
+if not API_KEY:
+    try:
+        from config import API_KEY as _K
+        API_KEY = _K
+    except Exception:
+        API_KEY = None
+if openai and API_KEY:
+    try:
+        openai.api_key = API_KEY
+    except Exception:
+        pass
 
-import os, sys, csv, uuid, json, argparse, datetime as dt, re
-import psycopg2
-import psycopg2.extras
-
-# OpenAI 0.28.x uyumu (app.py ile aynı stil)
-import openai
-
-# ---- ENV & Globals ----
 DB_URL = os.getenv("DATABASE_URL")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("API_KEY")
+if not DB_URL:
+    print("ERROR: DATABASE_URL is not set.", file=sys.stderr)
+    sys.exit(1)
 
-# ---- SQL ----
-SQL_INIT = """
-CREATE TABLE IF NOT EXISTS sreports (
-    id UUID PRIMARY KEY,
-    method TEXT,
-    lang TEXT,
-    report_text TEXT,
-    result_text TEXT,
-    embedding JSONB,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS cadors_index (
-    cadors_no TEXT PRIMARY KEY,
-    sreports_id UUID NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-"""
-
-SQL_SELECT_INDEX = "SELECT sreports_id FROM cadors_index WHERE cadors_no = %s;"
-SQL_INSERT_REPORT = """
-INSERT INTO sreports (id, method, lang, report_text, result_text, embedding, created_at)
-VALUES (%s, %s, %s, %s, %s, %s, NOW());
-"""
-SQL_INSERT_INDEX  = "INSERT INTO cadors_index (cadors_no, sreports_id) VALUES (%s, %s);"
-
-# ---- Helpers ----
-def connect():
-    if not DB_URL:
-        print("ERROR: DATABASE_URL yok.", file=sys.stderr)
-        sys.exit(1)
+# --------- SQL helpers ----------
+def get_conn():
     return psycopg2.connect(DB_URL, sslmode="require")
 
-def init_tables():
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(SQL_INIT)
-        conn.commit()
+def init_cadors_tables():
+    """cadors_index tablosu (mapping) yoksa oluşturur."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cadors_index (
+        cadors_no TEXT PRIMARY KEY,
+        sreports_id UUID NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """)
+    conn.commit()
+    cur.close(); conn.close()
 
-def norm_header(h: str) -> str:
-    return re.sub(r"\s+", " ", (h or "").strip()).lower()
-
-def get(row, *keys, default="") -> str:
-    """
-    CSV kolon isimleri değişebildiği için esnek al.
-    örn: ('Cadors Number','CADORS Number','CADORS No')
-    """
-    lowered = {norm_header(k): v for k, v in row.items()}
-    for k in keys:
-        v = lowered.get(norm_header(k))
-        if v not in (None, ""):
-            return str(v).strip()
-    return default
-
-def build_report_text(row: dict) -> str:
-    # Alanlar (esnek başlık eşleşmesi)
-    cad = get(row, "Cadors Number", "CADORS Number", "CADORS No", "CADORS #")
-    odate = get(row, "Occurrence Date", "Event Date", "Date")
-    otime = get(row, "Occurrence Time", "Time")
-    otype = get(row, "Occurrence Type", "Type")
-    aerodrome = get(row, "Aerodrome Name", "Aerodrome")
-    location  = get(row, "Occurrence Location", "Location")
-    province  = get(row, "Province")
-    country   = get(row, "Country")
-    ac_reg    = get(row, "Registration", "Aircraft Registration")
-    ac_make   = get(row, "Make", "Aircraft Make")
-    ac_model  = get(row, "Model", "Aircraft Model")
-    phase     = get(row, "Phase of Flight", "Phase")
-    operator  = get(row, "Operator")
-    summary   = get(row, "All Narrative (Delimited by Date)", "Narrative", "Summary")
-    # Markdown benzeri sade metin (app.pdf renderer bunu güzel basıyor)
-    parts = [
-        f"### CADORS {cad}",
-        f"- Occurrence Date/Time: {odate or '-'} {otime or ''}".strip(),
-        f"- Type: {otype or '-'}",
-        f"- Location: {location or '-'} / {aerodrome or '-'} / {province or '-'} / {country or '-'}",
-        f"- Aircraft: {ac_reg or '-'} / {ac_make or '-'} {ac_model or ''}".strip(),
-        f"- Phase: {phase or '-'}",
-        f"- Operator: {operator or '-'}",
-        "",
-        "### Incident Summary",
-        summary or "-",
-    ]
-    return "\n".join(parts).strip(), cad
-
+# --------- Embedding ----------
 def get_embedding(text: str):
-    # OpenAI 0.28.x
+    if (not openai) or (not API_KEY):
+        raise RuntimeError("OpenAI embeddings unavailable (package or API key missing)")
+    # Aynı modeli app.py'dekiyle uyumlu tutalım
     resp = openai.Embedding.create(model="text-embedding-3-small", input=text)
     return resp["data"][0]["embedding"]
 
-def upsert_row(row: dict, do_embed: bool) -> tuple[bool, bool]:
+# --------- CSV -> metin ----------
+def build_report_text(row: dict) -> str:
     """
-    Returns: (inserted, duplicate)
+    CADORS CSV'den anlaşılır, tek metinlik bir özet oluşturur.
+    Sütun adları Transport Canada indirmesine göre değişebilir; esnek al.
     """
-    report_text, cad_no = build_report_text(row)
-    if not cad_no:
-        # boş/bozuk satır
-        return (False, False)
+    def g(*keys, default=""):
+        for k in keys:
+            if k in row and row[k]:
+                return str(row[k]).strip()
+        return default
 
-    with connect() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(SQL_SELECT_INDEX, (cad_no,))
-            hit = cur.fetchone()
-            if hit:
-                # zaten var
-                return (False, True)
+    cad_no   = g("Cadors Number", "CADORS Number", "Cadors #", default="(unknown)")
+    odate    = g("Occurrence Date", "Date", default="")
+    otime    = g("Occurrence Time", "Time", default="")
+    otype    = g("Occurrence Type", "Type", default="")
+    aerodrome= g("Aerodrome Name", "Aerodrome", default="")
+    loc      = g("Occurrence Location", "Location", default="")
+    prov     = g("Province", default="")
+    region   = g("Occurrence Region", "Region", default="")
+    event    = g("Event(s)", "Events", default="")
+    cat      = g("Category(ies)", "Categories", default="")
+    ac_reg   = g("Registration", default="")
+    ac_make  = g("Make", default="")
+    ac_model = g("Model", default="")
+    phase    = g("Phase of Flight", "Phase", default="")
+    narrative= g("All Narrative (Delimited by Date)", "Narrative", default="")
 
-            rid = uuid.uuid4()
+    header = f"[CADORS {cad_no}] {odate} {otime} — {otype}".strip()
+    parts = [
+        header,
+        f"Aerodrome: {aerodrome} | Location: {loc} | Province/Region: {prov or '-'} / {region or '-'}",
+        f"Aircraft: {ac_reg or '-'} {ac_make or ''} {ac_model or ''} | Phase: {phase or '-'}",
+    ]
+    if event or cat:
+        parts.append(f"Events/Categories: {', '.join([p for p in [event, cat] if p])}")
+    if narrative:
+        parts.append(f"Narrative: {narrative}")
+    return "\n".join([p for p in parts if p]).strip()
+
+# --------- Upsert tek kayıt ----------
+def upsert_cadors_row(conn, row: dict, do_embed: bool):
+    cad_no = (row.get("Cadors Number") or row.get("CADORS Number") or row.get("Cadors #") or "(unknown)").strip()
+    rid = uuid.uuid4()
+
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    # Zaten eklenmiş mi?
+    cur.execute("SELECT sreports_id FROM cadors_index WHERE cadors_no=%s;", (cad_no,))
+    got = cur.fetchone()
+    if got:
+        cur.close()
+        return False, got["sreports_id"]  # skip (duplicate)
+
+    text = build_report_text(row)
+
+    emb = None
+    if do_embed:
+        try:
+            emb = get_embedding(text)
+        except Exception as e:
+            # Embedding alınamazsa yine de kaydı metinsiz bırakmayalım
+            print(f"[WARN] embedding failed for {cad_no}: {e}", file=sys.stderr)
             emb = None
-            if do_embed:
-                if not OPENAI_KEY:
-                    raise RuntimeError("OPENAI_API_KEY yok; --embed için gerekli.")
-                openai.api_key = OPENAI_KEY
-                try:
-                    emb = get_embedding(report_text)
-                except Exception as e:
-                    # embedding hatası olursa yine de kaydı tut (embedding NULL kalsın)
-                    print(f"[WARN] embedding fail for {cad_no}: {e}", file=sys.stderr)
-                    emb = None
 
-            cur.execute(
-                SQL_INSERT_REPORT,
-                (
-                    str(rid),
-                    "Imported (CADORS)",
-                    "English",
-                    report_text,
-                    "",          # result_text boş, istersen daha sonra app içinde üretirsin
-                    json.dumps(emb) if emb is not None else None,
-                ),
-            )
-            cur.execute(SQL_INSERT_INDEX, (cad_no, str(rid)))
-        conn.commit()
+    cur.execute("""
+        INSERT INTO sreports (id, method, lang, report_text, result_text, embedding)
+        VALUES (%s, %s, %s, %s, %s, %s);
+    """, (str(rid), "Imported (CADORS)", "English", text, "", json.dumps(emb) if emb is not None else None))
+    cur.execute("INSERT INTO cadors_index (cadors_no, sreports_id) VALUES (%s, %s);", (cad_no, str(rid)))
+    conn.commit()
+    cur.close()
+    return True, str(rid)
 
-    return (True, False)
+# --------- Geriye dönük embedding ----------
+def reembed_existing(conn, limit=25000):
+    """method='Imported (CADORS)' olan ve embedding'i boş olan raporlar için embedding üretir."""
+    if (not openai) or (not API_KEY):
+        print("[reembed] OpenAI key yok, atlanıyor.", flush=True)
+        return
 
-# ---- CLI ----
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, report_text
+        FROM sreports
+        WHERE method='Imported (CADORS)'
+          AND (embedding IS NULL OR embedding::text='null' OR embedding::text='[]')
+        ORDER BY created_at DESC
+        LIMIT %s;
+    """, (limit,))
+    rows = cur.fetchall()
+    total = len(rows)
+    if total == 0:
+        print("[reembed] hedef kayıt yok (embedding zaten dolu).", flush=True)
+        cur.close()
+        return
+
+    print(f"[reembed] başlıyor: {total} kayıt", flush=True)
+    done = 0
+    for rid, txt in rows:
+        try:
+            emb = get_embedding(txt or "")
+        except Exception as e:
+            print(f"[reembed] {rid} hata: {e}", flush=True)
+            continue
+        cur.execute("UPDATE sreports SET embedding=%s WHERE id=%s;", (json.dumps(emb), rid))
+        done += 1
+        if done % 200 == 0:
+            conn.commit()
+            print(f"[reembed] {done}/{total}", flush=True)
+    conn.commit()
+    cur.close()
+    print(f"[reembed] tamamlandı: {done}/{total}", flush=True)
+
+# --------- Argparse ----------
 def parse_args():
-    p = argparse.ArgumentParser(description="Import CADORS CSV -> sreports (+cadors_index)")
-    p.add_argument("--csv", required=True, help="CSV path")
-    p.add_argument("--embed", action="store_true", help="OpenAI embedding üret")
-    p.add_argument("--max-rows", type=int, default=None, help="En fazla şu kadar satır işle")
+    p = argparse.ArgumentParser(description="Import CADORS CSV into sreports (with optional embeddings).")
+    p.add_argument("--csv", required=True, help="Path to CADORS CSV (UTF-8/UTF-8-SIG)")
+    p.add_argument("--embed", action="store_true", help="Generate embeddings while inserting")
+    p.add_argument("--max-rows", type=int, default=10**9, help="Max rows to process from CSV")
+    p.add_argument("--reembed", action="store_true",
+                   help="Existing CADORS rows: backfill embeddings where missing.")
+    p.add_argument("--reembed-max", type=int, default=25000,
+                   help="How many existing CADORS rows to (re)embed at most.")
     return p.parse_args()
 
+# --------- Main ----------
 def main():
     args = parse_args()
 
-    if args.embed:
-        if not OPENAI_KEY:
-            print("ERROR: --embed verildi ama OPENAI_API_KEY yok.", file=sys.stderr)
-            sys.exit(1)
-        openai.api_key = OPENAI_KEY
-    else:
-        print("[INFO] running WITHOUT embeddings (use --embed to enable)")
+    if args.embed and (not API_KEY or not openai):
+        print("[INFO] OPENAI_API_KEY yok veya openai paketi yok. --embed devre dışı kalacak.", file=sys.stderr)
+        args.embed = False
+    if not args.embed:
+        print("[INFO] running WITHOUT embeddings (use --embed to enable)", flush=True)
 
     if not os.path.exists(args.csv):
-        print(f"ERROR: CSV bulunamadı: {args.csv}", file=sys.stderr)
+        print(f"ERROR: CSV not found: {args.csv}", file=sys.stderr)
         sys.exit(1)
 
-    init_tables()
+    init_cadors_tables()
 
-    total = inserted = skipped = dup = 0
+    conn = get_conn()
+    total, inserted, skipped, dup = 0, 0, 0, 0
+
     with open(args.csv, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             total += 1
+            if total > args.max_rows:
+                break
             try:
-                ok, is_dup = upsert_row(row, do_embed=args.embed)
+                ok, _rid = upsert_cadors_row(conn, row, do_embed=args.embed)
                 if ok:
                     inserted += 1
-                elif is_dup:
-                    dup += 1
                 else:
-                    skipped += 1
+                    dup += 1
             except Exception as e:
                 skipped += 1
-                print(f"[WARN] insert fail on row#{total}: {e}", file=sys.stderr)
+                print(f"[WARN] insert fail (row #{total}): {e}", file=sys.stderr)
 
-            if args.max_rows and total >= args.max_rows:
-                break
+    print(f"DONE. total={total} inserted={inserted} skipped={skipped} dup={dup}", flush=True)
 
-    print(f"DONE. total={total} inserted={inserted} skipped={skipped} dup={dup}")
+    # İstenirse mevcut CADORS kayıtlarının boş embeddinglerini doldur
+    if args.reembed:
+        reembed_existing(conn, limit=args.reembed_max)
+
+    conn.close()
 
 if __name__ == "__main__":
     main()
